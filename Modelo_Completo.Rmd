@@ -1,0 +1,2739 @@
+---
+title: "MODELAMIENTO ECONOMÉTRICO Y PREDICTIVO (EBS 2023)"
+subtitle: "Doble Validación: Muestra Completa (100%) vs. Partición (Train/Test) | Doble Ranking (PPO vs. XGBoost) y Cartografía por Macrozona"
+author: "Germán Lara, Jorge Correa y Martín Reyes | Docente: Dr. José Miguel Zúñiga"
+date: "Noviembre 2026"
+lang: es-CL
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: false
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+    self_contained: true
+    mathjax: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 6,
+  fig.align = 'center',
+  dpi = 160,
+  cache = FALSE
+)
+options(knitr.kable.NA = '—', scipen = 999)
+
+# Formato numérico chileno para cifras en el texto
+fx <- function(x, d = 3) trimws(format(round(x, d), nsmall = d, decimal.mark = ',', big.mark = '.'))
+fp <- function(p) ifelse(p < 0.0001, '< 0{,}0001', paste0('= ', gsub(',', '{,}', fx(p, 4))))
+dir.create("salidas/tablas", recursive = TRUE, showWarnings = FALSE)
+```
+
+<style>
+body {
+  text-align: justify;
+  font-size: 15px;
+  line-height: 1.7;
+}
+h1, h2, h3 {
+  color: #174c63;
+  font-weight: 700;
+}
+</style>
+
+# PARTE I: BLOQUE COMPUTACIONAL (CÓDIGOS COMENTADOS) {.tabset}
+
+En esta primera parte se presenta el flujo computacional completo y reproducible en R, organizado por etapas metodológicas. Cada bloque contiene comentarios que fundamentan las decisiones estadísticas. Los cálculos más pesados (imputaciones, 320 submodelos de Shapley y validación cruzada de XGBoost) se guardan en archivos `cache_*.rds` y solo se recalculan si cambian los datos o la especificación.
+
+## 1. Carga de Paquetes y Preparación de Datos
+
+```{r paso1-carga-y-preparacion}
+# ==============================================================================
+# ETAPA 1: CONFIGURACIÓN, LIBRERÍAS Y LECTURA DE DATOS
+# ==============================================================================
+
+# Paquetes requeridos para análisis de encuestas complejas, modelos ordinales,
+# imputación múltiple, análisis espacial, machine learning y visualización avanzada.
+paquetes <- c('haven', 'survey', 'MASS', 'mice', 'mitools', 'sf', 
+              'chilemapas', 'ggplot2', 'dplyr', 'knitr', 'rmarkdown', 'brant', 'xgboost')
+# VGAM y svyVGAM se usan con '::' (sin adjuntarlos) para que no enmascaren funciones
+# de MASS o survey; se instalan si faltan.
+for (pkg in c('VGAM', 'svyVGAM')) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, repos = 'https://cloud.r-project.org')
+}
+
+for (pkg in paquetes) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = 'https://cloud.r-project.org')
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# Configuración de muestreo complejo para conglomerados unitarios (lonely PSUs)
+options(survey.lonely.psu = 'adjust', survey.adjust.domain.lonely = FALSE)
+set.seed(20261112)
+
+# Lectura de la base oficial EBS 2023 en formato Stata (.dta)
+ruta_dta <- 'Base de datos EBS 2023.dta'
+if (!file.exists(ruta_dta)) {
+  # Si se ejecuta desde otra ubicación relativa
+  rutas_alt <- c('../Base de datos EBS 2023.dta', 'Base de datos EBS 2023.dta')
+  ruta_dta <- rutas_alt[file.exists(rutas_alt)][1]
+}
+
+ebs_raw <- haven::read_dta(ruta_dta)
+b <- as.data.frame(haven::zap_labels(ebs_raw))
+b$id_fila <- seq_len(nrow(b))
+
+# Definición de vectores de variables:
+# 1. Seis deficiencias habitacionales críticas (variables de interés principal)
+def <- c('vv1_a', 'vv1_b', 'vv1_c', 'vv1_d', 'vv2', 'vv3')
+
+# 2. Controles sociodemográficos, socioeconómicos, de entorno y territoriales
+controles <- c('ind_hacina_casen', 'hh_d_estado_casen', 'ten_viv_casen', 'qaut_casen',
+               'tramoebs2', 'sg01', 'l3_recat', 'educacion', 'activ_ebs', 'g2', 
+               'g3_a', 'g3_f', 'v36a_casen', 'v36b_casen', 'v36c_casen', 
+               'glosa_area', 'h2_c', 'territorio')
+
+pred <- c(def, controles)
+
+# Nombres legibles en español para tablas y gráficos
+nombre_var <- c(
+  vv1_a = 'Humedad o goteras',
+  vv1_b = 'Escasez de luz natural',
+  vv1_c = 'Falta de ventilación',
+  vv1_d = 'Ruidos molestos',
+  vv2   = 'Frío en la vivienda',
+  vv3   = 'Calor en la vivienda',
+  ind_hacina_casen   = 'Hacinamiento',
+  hh_d_estado_casen  = 'Estado de conservación',
+  ten_viv_casen      = 'Tenencia de la vivienda',
+  qaut_casen         = 'Quintil de ingreso autónomo',
+  tramoebs2          = 'Tramo etario',
+  sg01               = 'Sexo',
+  l3_recat           = 'Estado civil',
+  educacion          = 'Nivel educativo',
+  activ_ebs          = 'Condición de actividad',
+  g2                 = 'Medio ambiente comunal',
+  g3_a               = 'Contaminación del aire',
+  g3_f               = 'Basura en el entorno',
+  v36a_casen         = 'Rayados o daños en el barrio',
+  v36b_casen         = 'Consumo de drogas/alcohol',
+  v36c_casen         = 'Tráfico de drogas',
+  glosa_area         = 'Área geográfica',
+  h2_c               = 'Seguridad nocturna al caminar',
+  territorio         = 'Territorio (Maule vs. Resto)'
+)
+
+# Limpieza de códigos especiales de no respuesta (-88: No sabe, -99: No responde)
+fuentes <- unique(c('a9', setdiff(pred, c('educacion', 'territorio')), 
+                    'l4', 'l5_recat', 'educ_recat_casen', 'glosa_region'))
+
+for (v in fuentes) {
+  b[[v]][b[[v]] %in% c(-88, -99, '')] <- NA
+}
+
+# Construcción de variable unificada de educación (siguiendo criterio Casen/EBS)
+b$educacion <- ifelse(!is.na(b$l4) & b$l4 == 2, b$l5_recat, b$educ_recat_casen)
+
+# Variable territorial corregida: Resto del país como base, Maule como categoría evaluada
+b$territorio <- ifelse(is.na(b$glosa_region), NA, 
+                       ifelse(b$glosa_region == 'Maule', 'Maule', 'Resto del país'))
+
+# Diccionario de niveles y homogeneización de referencias
+et <- list()
+for (v in setdiff(pred, c('educacion', 'territorio', 'glosa_area', 'g3_a', 'g3_f'))) {
+  lab <- attr(ebs_raw[[v]], 'labels')
+  lab <- lab[!lab %in% c(-88, -99)]
+  lab <- lab[order(lab)]
+  et[[v]] <- setNames(names(lab), as.character(lab))
+}
+
+# Correcciones específicas de niveles:
+et$tramoebs2 <- sub(' A ', ' a ', et$tramoebs2, fixed = TRUE)
+et$educacion <- c('1' = 'Básica', '2' = 'Media', '3' = 'Superior', '-77' = 'Otra')
+# Referencia: Resto del país (para que el coeficiente mida directamente la diferencia Maule)
+et$territorio <- c('Resto del país' = 'Resto del país', 'Maule' = 'Maule')
+et$glosa_area <- c('Rural' = 'Rural', 'Urbano' = 'Urbano')
+
+# Homogeneización de deficiencias: Referencia = 2 (No presenta), Comparación = 1 (Sí presenta)
+for (v in def) et[[v]] <- c('2' = 'No', '1' = 'Sí')
+
+# Homogeneización de externalidades de entorno (g3_a y g3_f):
+# Se corrige la inconsistencia previa: Referencia = No (sin problema), Comparación = Sí (expuesto)
+et$g3_a <- c('2' = '2. No', '1' = '1. Sí')
+et$g3_f <- c('2' = '2. No', '1' = '1. Sí')
+
+# Hacinamiento: fusión de categoría 4 (crítico) con 3 (alto) por bajo tamaño muestral
+et$ind_hacina_casen <- c('1' = 'Sin hacinamiento', '2' = 'Medio', '3' = 'Alto o crítico')
+b$ind_hacina_casen[b$ind_hacina_casen == 4 & !is.na(b$ind_hacina_casen)] <- 3
+
+# Conversión a factores con niveles explícitos
+for (v in pred) {
+  b[[v]] <- factor(as.character(b[[v]]), levels = names(et[[v]]), labels = unname(et[[v]]))
+}
+
+# Variable respuesta ordinal: a9 (Satisfacción con la vivienda, escala 1 a 5)
+respuestas <- c('Totalmente insatisfecho', 'Insatisfecho', 'Indiferente', 
+                'Satisfecho', 'Totalmente satisfecho')
+b$y <- ordered(b$a9, levels = 1:5, labels = respuestas)
+
+# Códigos geográficos oficiales de 16 regiones y clasificación en 3 Macrozonas
+cod_to_glosa <- c(
+  '15' = 'Arica Y Parinacota', '01' = 'Tarapaca', '02' = 'Antofagasta', 
+  '03' = 'Atacama', '04' = 'Coquimbo', '05' = 'Valparaiso', 
+  '13' = 'Metropolitana De Santiago', '06' = "Libertador General Bernardo O'higgins", 
+  '07' = 'Maule', '16' = 'Ñuble', '08' = 'Biobio', 
+  '09' = 'La Araucania', '14' = 'Los Rios', '10' = 'Los Lagos', 
+  '11' = 'Aysen Del General Carlos Ibañez Del Campo', 
+  '12' = 'Magallanes Y De La Antartica Chilena'
+)
+glosa_to_cod <- setNames(names(cod_to_glosa), cod_to_glosa)
+b$codigo_region <- sprintf('%02d', as.integer(glosa_to_cod[as.character(b$glosa_region)]))
+
+# Definición estándar de Macrozonas del Ministerio de Vivienda y Urbanismo (MINVU):
+# Norte: Arica a Coquimbo (15, 01, 02, 03, 04)
+# Centro: Valparaíso a Biobío, incluye RM (05, 13, 06, 07, 16, 08)
+# Sur/Austral: Araucanía a Magallanes (09, 14, 10, 11, 12)
+cod_to_zona <- c(
+  '15' = 'Zona Norte', '01' = 'Zona Norte', '02' = 'Zona Norte', '03' = 'Zona Norte', '04' = 'Zona Norte',
+  '05' = 'Zona Centro', '13' = 'Zona Centro', '06' = 'Zona Centro', '07' = 'Zona Centro', '16' = 'Zona Centro', '08' = 'Zona Centro',
+  '09' = 'Zona Sur', '14' = 'Zona Sur', '10' = 'Zona Sur', '11' = 'Zona Sur', '12' = 'Zona Sur'
+)
+b$macrozona <- factor(cod_to_zona[b$codigo_region], levels = c('Zona Norte', 'Zona Centro', 'Zona Sur'))
+
+# Bandera de casos completos para el análisis clásico
+b$completo <- complete.cases(b[c('y', pred)])
+```
+
+## 2. Tratamiento e Imputación Múltiple de Datos Faltantes (MICE)
+
+```{r paso2-imputacion-mice}
+# ==============================================================================
+# ETAPA 2: ANÁLISIS DE FALTANTES E IMPUTACIÓN MICE (ENDERS, 2010)
+# ==============================================================================
+
+# Diagnóstico de tasas de no respuesta por variable
+tabla_faltantes <- data.frame(
+  Variable = c('Satisfacción (Y)', unname(nombre_var[pred])),
+  Casos_NA = colSums(is.na(b[c('y', pred)])),
+  Pct_NA = round(100 * colMeans(is.na(b[c('y', pred)])), 2)
+)
+tabla_faltantes <- tabla_faltantes[order(-tabla_faltantes$Casos_NA), ]
+
+# Imputación Múltiple por Ecuaciones Encadenadas (MICE; van Buuren, 2018; Enders, 2010)
+# Se imputan m = 5 bases bajo el supuesto de Faltantes al Azar (MAR). Cada variable
+# incompleta se imputa con un modelo CONDICIONAL a todas las demás, acorde a su escala:
+#   - binarias (deficiencias, g3_a, g3_f, estado civil): regresión logística ('logreg')
+#   - ordinales (Y, hacinamiento, medio ambiente g2, seguridad h2_c): logit
+#     acumulado ('polr'), que respeta el orden de las categorías
+#   - nominales (nivel educativo, que incluye 'Otra'): logit multinomial ('polyreg')
+# Variables auxiliares del diseño (completas, no imputadas): región y log(fexp). Así
+# el modelo de imputación es congruente con un análisis ponderado y estratificado
+# (Lumley, 2010, cap. 9). 'territorio' se excluye como predictor porque es una
+# función exacta de la región (colinealidad perfecta).
+vars_mice <- c('y', pred)
+vars_ordinales_mice <- c('ind_hacina_casen', 'g2', 'h2_c')
+
+datos_imp_in <- b[vars_mice]
+for (v in vars_ordinales_mice) {
+  datos_imp_in[[v]] <- factor(datos_imp_in[[v]], levels = levels(datos_imp_in[[v]]), ordered = TRUE)
+}
+datos_imp_in$fexp_log <- log(b$fexp)
+datos_imp_in$region <- factor(b$glosa_region)
+
+config_mice <- mice::mice(datos_imp_in, maxit = 0)
+matriz_pred_mice <- config_mice$predictorMatrix
+matriz_pred_mice[, 'territorio'] <- 0
+metodos_mice <- config_mice$method        # logreg / polr / polyreg según la escala
+
+# Ejecución (m = 5, maxit = 10). Tarda varios minutos, por lo que el resultado se
+# guarda en caché y solo se recalcula si cambian los datos de entrada o los métodos.
+ruta_cache_mice <- 'cache_mice_imputacion.rds'
+cache_mice <- if (file.exists(ruta_cache_mice)) readRDS(ruta_cache_mice) else NULL
+cache_vigente <- !is.null(cache_mice) &&
+  identical(cache_mice$datos, datos_imp_in) && identical(cache_mice$metodos, metodos_mice)
+
+if (cache_vigente) {
+  imp_mice <- cache_mice$imp
+} else {
+  if (requireNamespace('future', quietly = TRUE) && requireNamespace('furrr', quietly = TRUE)) {
+    # Una cadena por núcleo; reproducible mediante 'parallelseed'
+    imp_mice <- mice::futuremice(datos_imp_in, m = 5, maxit = 10, method = metodos_mice,
+                                 predictorMatrix = matriz_pred_mice,
+                                 n.core = min(5, max(1, parallel::detectCores() - 1)),
+                                 parallelseed = 20261112)
+  } else {
+    imp_mice <- mice::mice(datos_imp_in, m = 5, maxit = 10, method = metodos_mice,
+                           predictorMatrix = matriz_pred_mice, printFlag = FALSE, seed = 20261112)
+  }
+  saveRDS(list(datos = datos_imp_in, metodos = metodos_mice, imp = imp_mice), ruta_cache_mice)
+}
+
+# Resumen de los métodos usados por variable incompleta
+tabla_metodos_mice <- data.frame(
+  Variable = unname(c(`y` = 'Satisfacción (Y)', nombre_var)[names(metodos_mice)[metodos_mice != '']]),
+  Casos_NA = colSums(is.na(datos_imp_in))[metodos_mice != ''],
+  Metodo = unname(metodos_mice[metodos_mice != ''])
+)
+
+# Base imputada i: se devuelven los factores ordinales a factores nominales con los
+# mismos niveles, para que los modelos usen contrastes de tratamiento (no polinomiales).
+completar_imputacion <- function(i) {
+  df_i <- b
+  imp_i <- mice::complete(imp_mice, i)[vars_mice]
+  for (v in vars_ordinales_mice) imp_i[[v]] <- factor(as.character(imp_i[[v]]), levels = levels(b[[v]]))
+  df_i[vars_mice] <- imp_i
+  df_i
+}
+
+# Ajuste de modelos svyolr sobre cada base imputada y combinación con reglas de Rubin
+disenos_imp <- lapply(1:imp_mice$m, function(i) {
+  survey::svydesign(ids = ~varunit, strata = ~estrato_ebs, weights = ~fexp, nest = TRUE,
+                    data = completar_imputacion(i))
+})
+
+f_modelo <- reformulate(pred, response = 'y')
+modelos_mice_list <- lapply(disenos_imp, function(dis) {
+  survey::svyolr(f_modelo, design = dis, method = 'logistic')
+})
+
+# Agrupación Rubin mediante mitools::MIcombine
+coefs_mice <- lapply(modelos_mice_list, coef)
+vcov_mice <- lapply(modelos_mice_list, vcov)
+rubin_pool <- mitools::MIcombine(coefs_mice, vcov_mice)
+res_rubin <- summary(rubin_pool)
+```
+
+## 3. Estimación del Modelo Logit Ordenado y Comprobación de Supuestos
+
+```{r paso3-modelo-y-supuestos}
+# ==============================================================================
+# ETAPA 3: ESTIMACIÓN CON DISEÑO COMPLEJO Y COMPROBACIÓN DE SUPUESTOS
+# ==============================================================================
+
+# Objeto de diseño muestral para la muestra de casos completos (n = 10.935)
+diseno_completo <- subset(
+  survey::svydesign(ids = ~varunit, strata = ~estrato_ebs, weights = ~fexp, nest = TRUE, data = b),
+  completo
+)
+d_analitica <- diseno_completo$variables
+gl_diseno <- survey::degf(diseno_completo)
+
+# Estimación del modelo acumulado bajo survey::svyolr
+modelo_logit <- survey::svyolr(f_modelo, design = diseno_completo, method = 'logistic')
+
+# Extracción de coeficientes, errores estándar y cálculo de Odds Ratios
+beta <- modelo_logit$coefficients
+V_cov <- vcov(modelo_logit)
+se_diseno <- sqrt(diag(V_cov))[names(beta)]
+crit_t <- qt(0.975, df = gl_diseno)
+
+tabla_or <- data.frame(
+  Termino = names(beta),
+  Beta = as.numeric(beta),
+  SE = as.numeric(se_diseno),
+  OR = exp(beta),
+  LI_95 = exp(beta - crit_t * se_diseno),
+  LS_95 = exp(beta + crit_t * se_diseno),
+  p_valor = 2 * pt(-abs(beta / se_diseno), df = gl_diseno)
+)
+
+# ------------------------------------------------------------------------------
+# Comprobación de Supuesto 1: Odds Proporcionales (Paralelismo con diseño)
+# Se ajustan 4 logits binarios acumulados P(Y > j) y se contrasta la igualdad
+# de pendientes mediante funciones de influencia apiladas (Wald de diseño).
+# ------------------------------------------------------------------------------
+binarios_cortes <- lapply(1:4, function(j) {
+  dj <- update(diseno_completo, supera = as.integer(y) > j)
+  survey::svyglm(reformulate(pred, response = 'supera'), design = dj,
+                 family = quasibinomial(), influence = TRUE)
+})
+
+influencias_mat <- do.call(cbind, lapply(binarios_cortes, function(m) attr(m, 'influence')))
+V_conjunta <- survey::svyrecvar(influencias_mat, diseno_completo$cluster, 
+                               diseno_completo$strata, diseno_completo$fpc, 
+                               postStrata = diseno_completo$postStrata, lonely.psu = 'adjust')
+
+bc_vector <- unlist(lapply(binarios_cortes, coef), use.names = FALSE)
+p_binario <- length(coef(binarios_cortes[[1]]))
+
+# Matriz de contrastes de igualdad respecto al corte 1
+contraste_paralelismo <- function(k_indices) {
+  C <- matrix(0, nrow = 3 * length(k_indices), ncol = length(bc_vector))
+  row_c <- 0
+  for (j in 2:4) {
+    for (h in k_indices) {
+      row_c <- row_c + 1
+      C[row_c, h] <- -1
+      C[row_c, (j - 1) * p_binario + h] <- 1
+    }
+  }
+  u_diff <- as.vector(C %*% bc_vector)
+  S_mat <- C %*% V_conjunta %*% t(C)
+  eig <- eigen(S_mat, symmetric = TRUE)
+  mantener <- eig$values > max(eig$values) * 1e-9
+  W_stat <- sum((crossprod(eig$vectors[, mantener, drop = FALSE], u_diff))^2 / eig$values[mantener])
+  q_rank <- sum(mantener)
+  c(F_stat = W_stat / q_rank, gl1 = q_rank, gl2 = gl_diseno, 
+    p = pf(W_stat / q_rank, q_rank, gl_diseno, lower.tail = FALSE))
+}
+
+# Matriz del modelo para mapeo de factores
+X_mat <- model.matrix(reformulate(pred), d_analitica)
+asignacion_vars <- attr(X_mat, 'assign')[-1]
+
+# Contraste global y por variable
+res_paralelismo <- data.frame(
+  Variable = c('Global (Omnibus)', unname(nombre_var[pred])),
+  t(sapply(c(list(2:p_binario), lapply(seq_along(pred), function(j) which(asignacion_vars == j) + 1)), 
+           contraste_paralelismo))
+)
+res_paralelismo$p_Holm <- c(NA, p.adjust(res_paralelismo$p[-1], method = 'holm'))
+
+# Clasificación de predictores (regla de Williams, 2006: Wald por variable con
+# alfa = 0,05 sin corrección por multiplicidad, como en gologit2 'autofit').
+# Esta clasificación es la lista de CANDIDATOS a liberar; la especificación final
+# del PPO se confirma en la etapa 3c (selección hacia adelante).
+alpha_ppo <- 0.05
+res_paralelismo$Clasificacion <- c(
+  ifelse(res_paralelismo$p[1] < alpha_ppo, 'Se rechaza el paralelismo', 'Se cumple el paralelismo'),
+  ifelse(res_paralelismo$p[-1] < alpha_ppo, 'No paralelo (candidato)', 'Paralelo')
+)
+res_paralelismo$Codigo <- c(NA, pred)
+
+# ------------------------------------------------------------------------------
+# Comprobación de Supuesto 2: Multicolinealidad (GVIF ponderado)
+# ------------------------------------------------------------------------------
+X_no_int <- X_mat[, -1, drop = FALSE]
+R_cor <- cov.wt(X_no_int, wt = d_analitica$fexp, cor = TRUE)$cor
+ldet <- function(A) if (!length(A)) 0 else as.numeric(determinant(A, logarithm = TRUE)$modulus)
+
+tabla_gvif <- do.call(rbind, lapply(seq_along(pred), function(j) {
+  k <- which(asignacion_vars == j)
+  g <- exp(ldet(R_cor[k, k, drop = FALSE]) + ldet(R_cor[-k, -k, drop = FALSE]) - ldet(R_cor))
+  data.frame(Variable = nombre_var[pred[j]], gl = length(k), GVIF = g, 
+             GVIF_ajustado = g^(1 / (2 * length(k))))
+}))
+```
+
+## 3c. Modelo Final: Odds Parcialmente Proporcionales (PPO)
+
+```{r paso3c-modelo-ppo}
+# ==============================================================================
+# ETAPA 3c: MODELO DE ODDS PARCIALMENTE PROPORCIONALES (PPO; WILLIAMS, 2006)
+# ==============================================================================
+# Parametrización (VGAM::cumulative con reverse = TRUE):
+#   logit P(Y > j | x) = a_j + x'beta + z'gamma_j,   j = 1, 2, 3, 4
+# con a_j = -theta_j. Un coeficiente positivo aumenta la satisfacción, igual que
+# en svyolr, de modo que los coeficientes paralelos son directamente comparables.
+# Los términos de 'parallel = FALSE ~ z' reciben un coeficiente por umbral
+# (gamma_j) y el resto queda paralelo (beta común).
+
+# Ajuste con diseño complejo: svyVGAM::svy_vglm estima con pesos fexp y calcula la
+# varianza por linealización de Taylor (funciones de influencia sobre estratos/UPM).
+ajustar_ppo <- function(libres, diseno) {
+  restriccion <- if (length(libres)) {
+    as.formula(paste('FALSE ~', paste(libres, collapse = ' + ')))
+  } else TRUE
+  familia <- VGAM::cumulative(link = 'logitlink', reverse = TRUE, parallel = restriccion)
+  avisos <- character(0)
+  ajuste <- withCallingHandlers(
+    svyVGAM::svy_vglm(f_modelo, design = diseno, family = familia),
+    warning = function(w) { avisos <<- c(avisos, conditionMessage(w)); invokeRestart('muffleWarning') }
+  )
+  ajuste$avisos <- avisos
+  ajuste
+}
+
+# Probabilidades predichas P(Y = k), k = 1..5, a partir de un vector de coeficientes
+# con la nomenclatura de VGAM: '(Intercept):j', 'x' (paralelo) o 'x:j' (por umbral).
+predecir_ppo <- function(coefs, datos) {
+  X <- model.matrix(reformulate(pred), datos)[, -1, drop = FALSE]
+  eta <- sapply(1:4, function(j) {
+    b_j <- vapply(colnames(X), function(cc) {
+      if (paste0(cc, ':', j) %in% names(coefs)) coefs[[paste0(cc, ':', j)]] else coefs[[cc]]
+    }, numeric(1))
+    coefs[[paste0('(Intercept):', j)]] + drop(X %*% b_j)
+  })
+  S <- cbind(1, plogis(eta), 0)          # P(Y > j) para j = 0, ..., 5
+  P <- S[, 1:5] - S[, 2:6]               # P(Y = k)
+  colnames(P) <- respuestas
+  P
+}
+
+# Un ajuste es válido si no hubo avisos de VGAM, los errores estándar son finitos y
+# razonables, y TODAS las probabilidades predichas quedan dentro de (0, 1).
+ppo_valido <- function(ajuste, datos) {
+  ee <- sqrt(diag(ajuste$var))
+  P <- predecir_ppo(ajuste$coef, datos)
+  length(ajuste$avisos) == 0 && all(is.finite(ee)) && max(ee) < 50 && all(P > 0 & P < 1)
+}
+
+# Wald de diseño DENTRO del PPO para un predictor liberado:
+# H0: gamma_k1 = gamma_k2 = gamma_k3 = gamma_k4 (todas sus columnas dummy).
+columnas_de <- function(v) {
+  X0 <- model.matrix(reformulate(pred), d_analitica)
+  colnames(X0)[attr(X0, 'assign') == match(v, pred)]
+}
+wald_umbrales <- function(coefs, V, v, gl2 = gl_diseno) {
+  C <- do.call(rbind, lapply(columnas_de(v), function(cc) {
+    t(sapply(2:4, function(j) {
+      fila <- setNames(numeric(length(coefs)), names(coefs))
+      fila[paste0(cc, ':', j)] <- 1
+      fila[paste0(cc, ':1')] <- -1
+      fila
+    }))
+  }))
+  u <- C %*% coefs
+  W <- drop(t(u) %*% solve(C %*% V %*% t(C), u))
+  q <- nrow(C)
+  c(F_stat = W / q, gl1 = q, gl2 = gl2, p = pf(W / q, q, gl2, lower.tail = FALSE))
+}
+
+# ------------------------------------------------------------------------------
+# Selección de la especificación (hacia adelante, sobre los casos completos)
+# ------------------------------------------------------------------------------
+# Se liberan los candidatos de la etapa 3b en orden creciente de p-valor. Un
+# predictor se mantiene libre solo si (i) el PPO converge con probabilidades
+# válidas y (ii) el Wald de diseño de sus gamma_j dentro del PPO sigue siendo
+# significativo. Si liberarlo produce probabilidades fuera de (0, 1) (umbrales que
+# se cruzan; Williams, 2006, p. 63), queda paralelo.
+candidatos <- res_paralelismo[-1, ]
+candidatos <- candidatos[candidatos$p < alpha_ppo, ]
+candidatos <- candidatos[order(candidatos$p), ]
+
+vars_no_paralelas <- character(0)
+traza_seleccion <- list()
+for (v in candidatos$Codigo) {
+  ajuste_v <- ajustar_ppo(c(vars_no_paralelas, v), diseno_completo)
+  valido_v <- ppo_valido(ajuste_v, d_analitica)
+  prueba_v <- if (valido_v) wald_umbrales(ajuste_v$coef, ajuste_v$var, v) else c(F_stat = NA, p = NA)
+  acepta_v <- valido_v && prueba_v[['p']] < alpha_ppo
+  traza_seleccion[[v]] <- data.frame(
+    Variable = nombre_var[[v]],
+    p_3b = candidatos$p[candidatos$Codigo == v],
+    Min_Prob = min(predecir_ppo(ajuste_v$coef, d_analitica)),
+    Valido = valido_v,
+    F_PPO = prueba_v[['F_stat']],
+    p_PPO = prueba_v[['p']],
+    Decision = ifelse(acepta_v, 'Liberado (no paralelo)',
+                      ifelse(valido_v, 'Paralelo (no significativo en el PPO)',
+                             'Paralelo (liberarlo cruza los umbrales)'))
+  )
+  if (acepta_v) vars_no_paralelas <- c(vars_no_paralelas, v)
+}
+tabla_seleccion_ppo <- do.call(rbind, traza_seleccion)
+vars_paralelas <- setdiff(pred, vars_no_paralelas)
+
+# ------------------------------------------------------------------------------
+# Estimación final: PPO en cada una de las 5 bases imputadas + Reglas de Rubin
+# ------------------------------------------------------------------------------
+# NOTA: hereda la imputación de la etapa 2; al corregir el método de MICE, esta
+# etapa se actualiza sin cambios en el código.
+ppo_imp <- lapply(disenos_imp, function(dis) ajustar_ppo(vars_no_paralelas, dis))
+ppo_imp_validos <- mapply(function(aj, dis) ppo_valido(aj, dis$variables), ppo_imp, disenos_imp)
+stopifnot(all(ppo_imp_validos))
+
+rubin_ppo <- mitools::MIcombine(lapply(ppo_imp, `[[`, 'coef'), lapply(ppo_imp, `[[`, 'var'))
+coef_ppo <- coef(rubin_ppo)
+V_ppo <- vcov(rubin_ppo)
+se_ppo <- sqrt(diag(V_ppo))
+gl_ppo <- pmin(rubin_ppo$df, gl_diseno)   # gl de Rubin, acotados por los del diseño
+
+tabla_ppo <- data.frame(
+  Termino = names(coef_ppo),
+  Umbral = ifelse(grepl(':[1-4]$', names(coef_ppo)), sub('.*:', '', names(coef_ppo)), 'Común'),
+  Beta = coef_ppo,
+  SE = se_ppo,
+  OR = exp(coef_ppo),
+  LI_95 = exp(coef_ppo - qt(0.975, gl_ppo) * se_ppo),
+  LS_95 = exp(coef_ppo + qt(0.975, gl_ppo) * se_ppo),
+  p_valor = 2 * pt(-abs(coef_ppo / se_ppo), gl_ppo),
+  row.names = NULL
+)
+tabla_ppo$Variable <- vapply(tabla_ppo$Termino, function(t) {
+  if (grepl('^\\(Intercept\\)', t)) return('Umbral (intercepto)')
+  base <- sub(':[1-4]$', '', t)
+  v <- pred[vapply(pred, function(p) startsWith(base, p), logical(1))]
+  nombre_var[[v[which.max(nchar(v))]]]
+}, character(1))
+tabla_ppo$Categoria <- mapply(function(t, v) {
+  if (v == 'Umbral (intercepto)') return(paste('Corte', sub('.*:', '', t)))
+  cod <- names(nombre_var)[nombre_var == v]
+  sub(':[1-4]$', '', substring(t, nchar(cod) + 1))
+}, tabla_ppo$Termino, tabla_ppo$Variable)
+
+# Wald de diseño de los umbrales en el modelo combinado (confirmación final)
+tabla_wald_ppo <- do.call(rbind, lapply(vars_no_paralelas, function(v) {
+  data.frame(Variable = nombre_var[[v]], t(wald_umbrales(coef_ppo, V_ppo, v)))
+}))
+
+# ------------------------------------------------------------------------------
+# Comparación de ajuste: Restringido (todo paralelo) vs. PPO
+# ------------------------------------------------------------------------------
+# (a) Contraste principal: Wald de diseño conjunto de TODAS las restricciones que el
+#     PPO libera (gamma_kj = gamma_k1). Es la prueba válida con diseño complejo.
+# (b) Descriptivo: deviance ponderada (pesos normalizados a media 1) y AIC ponderado
+#     = deviance + 2k, promediados sobre las 5 imputaciones. Con diseño complejo no
+#     hay verosimilitud verdadera, por lo que (b) no se usa como prueba formal.
+restringido_imp <- lapply(disenos_imp, function(dis) ajustar_ppo(character(0), dis))
+
+C_conjunta <- do.call(rbind, lapply(vars_no_paralelas, function(v) {
+  do.call(rbind, lapply(columnas_de(v), function(cc) t(sapply(2:4, function(j) {
+    fila <- setNames(numeric(length(coef_ppo)), names(coef_ppo))
+    fila[paste0(cc, ':', j)] <- 1; fila[paste0(cc, ':1')] <- -1; fila
+  }))))
+}))
+u_conj <- C_conjunta %*% coef_ppo
+W_conj <- drop(t(u_conj) %*% solve(C_conjunta %*% V_ppo %*% t(C_conjunta), u_conj))
+wald_conjunto_ppo <- c(F_stat = W_conj / nrow(C_conjunta), gl1 = nrow(C_conjunta), gl2 = gl_diseno,
+                       p = pf(W_conj / nrow(C_conjunta), nrow(C_conjunta), gl_diseno, lower.tail = FALSE))
+
+deviance_ponderada <- function(coefs, datos) {
+  w <- datos$fexp / mean(datos$fexp)
+  P <- predecir_ppo(coefs, datos)
+  -2 * sum(w * log(P[cbind(seq_len(nrow(datos)), as.integer(datos$y))]))
+}
+ajuste_comparado <- function(lista_aj) {
+  dev <- mean(mapply(function(aj, dis) deviance_ponderada(aj$coef, dis$variables), lista_aj, disenos_imp))
+  k <- length(lista_aj[[1]]$coef)
+  c(Parametros = k, Deviance = dev, AIC = dev + 2 * k)
+}
+tabla_ajuste_ppo <- data.frame(
+  Modelo = c('Logit ordenado restringido (odds proporcionales)', 'PPO (odds parcialmente proporcionales)'),
+  rbind(ajuste_comparado(restringido_imp), ajuste_comparado(ppo_imp))
+)
+
+# ------------------------------------------------------------------------------
+# Validez del PPO: probabilidades predichas en [0, 1] para TODA la muestra
+# ------------------------------------------------------------------------------
+validez_ppo <- do.call(rbind, lapply(seq_along(disenos_imp), function(i) {
+  P <- predecir_ppo(coef_ppo, disenos_imp[[i]]$variables)
+  data.frame(Imputacion = i, N = nrow(P), Min_Prob = min(P), Max_Prob = max(P),
+             Casos_fuera_rango = sum(rowSums(P < 0 | P > 1) > 0),
+             Suma_max_desvio = max(abs(rowSums(P) - 1)))
+}))
+```
+
+## 4. Efectos Marginales y Comparación Territorial (Maule vs. Resto)
+
+```{r paso4-efectos-marginales-y-territorio}
+# ==============================================================================
+# ETAPA 4: EFECTOS MARGINALES ESTANDARIZADOS Y ANÁLISIS MAULE
+# ==============================================================================
+
+# Función de estandarización analítica para P(Y >= 4) con método Delta de diseño
+estandarizar_satisfaccion_alta <- function(ajuste, datos_eval, pesos = d_analitica$fexp) {
+  z_mat <- model.matrix(delete.response(terms(ajuste)), datos_eval)
+  z_mat <- z_mat[, names(ajuste$coefficients), drop = FALSE]
+  w_norm <- pesos / sum(pesos)
+  
+  # Probabilidad de corte 3: P(Y <= 3)
+  f_acum <- plogis(ajuste$zeta[3] - drop(z_mat %*% ajuste$coefficients))
+  h_der <- f_acum * (1 - f_acum)
+  
+  # Gradiente analítico respecto a coeficientes y umbral
+  grad <- c(colSums(z_mat * (w_norm * h_der)), rep(0, length(ajuste$zeta)))
+  grad[length(ajuste$coefficients) + 3] <- -sum(w_norm * h_der)
+  
+  # Probabilidad de superar el corte 3: P(Y >= 4)
+  p_alta <- sum(w_norm * (1 - f_acum))
+  list(p = p_alta, grad = grad)
+}
+
+# Efectos discretos estandarizados de las 6 deficiencias sobre P(Y >= 4)
+efectos_discretos_def <- do.call(rbind, lapply(def, function(v) {
+  d_con <- d_sin <- d_analitica
+  d_con[[v]][] <- 'Sí'
+  d_sin[[v]][] <- 'No'
+  
+  res_con <- estandarizar_satisfaccion_alta(modelo_logit, d_con)
+  res_sin <- estandarizar_satisfaccion_alta(modelo_logit, d_sin)
+  
+  delta_p <- res_con$p - res_sin$p
+  grad_delta <- res_con$grad - res_sin$grad
+  se_delta <- sqrt(drop(grad_delta %*% V_cov %*% grad_delta))
+  
+  data.frame(
+    Deficiencia = nombre_var[v],
+    Prob_Sin = 100 * res_sin$p,
+    Prob_Con = 100 * res_con$p,
+    Cambio_pp = 100 * delta_p,
+    LI_95 = 100 * (delta_p - crit_t * se_delta),
+    LS_95 = 100 * (delta_p + crit_t * se_delta)
+  )
+}))
+
+# ------------------------------------------------------------------------------
+# Comparación Territorial: Maule vs. Resto del País
+# ------------------------------------------------------------------------------
+# 1. Sin ajuste (crudo poblacional)
+dis_comp <- diseno_completo
+dis_comp$variables$alta <- as.numeric(as.integer(dis_comp$variables$y) >= 4)
+crudo_territorio <- survey::svyby(~alta, ~territorio, dis_comp, survey::svymean, covmat = TRUE)
+contraste_territorio <- setNames(
+  ifelse(crudo_territorio$territorio == 'Maule', 1, -1),
+  names(coef(crudo_territorio))
+)
+dif_cruda <- survey::svycontrast(crudo_territorio, contraste_territorio)
+
+# 2. Ajustado con el modelo completo (estandarización común)
+d_maule <- d_resto <- d_analitica
+d_maule$territorio[] <- 'Maule'
+d_resto$territorio[] <- 'Resto del país'
+
+est_maule <- estandarizar_satisfaccion_alta(modelo_logit, d_maule)
+est_resto <- estandarizar_satisfaccion_alta(modelo_logit, d_resto)
+dif_ajustada <- est_maule$p - est_resto$p
+grad_dif <- est_maule$grad - est_resto$grad
+se_dif_ajustada <- sqrt(drop(grad_dif %*% V_cov %*% grad_dif))
+
+tabla_comparacion_maule <- data.frame(
+  Escenario = c('Crudo (encuesta directa, casos completos)', 'Ajustado (logit restringido, solo referencia)'),
+  Maule_Pct = c(100 * crudo_territorio$alta[crudo_territorio$territorio == 'Maule'], 100 * est_maule$p),
+  Resto_Pct = c(100 * crudo_territorio$alta[crudo_territorio$territorio == 'Resto del país'], 100 * est_resto$p),
+  Diferencia_pp = c(100 * as.numeric(coef(dif_cruda)), 100 * dif_ajustada),
+  LI_95 = c(100 * (as.numeric(coef(dif_cruda)) - crit_t * as.numeric(survey::SE(dif_cruda))), 
+            100 * (dif_ajustada - crit_t * se_dif_ajustada)),
+  LS_95 = c(100 * (as.numeric(coef(dif_cruda)) + crit_t * as.numeric(survey::SE(dif_cruda))), 
+            100 * (dif_ajustada + crit_t * se_dif_ajustada))
+)
+
+# ------------------------------------------------------------------------------
+# Efectos Marginales Promedio (AME) de las 6 deficiencias en el PPO (modelo final)
+# ------------------------------------------------------------------------------
+# AME_k = sum_i w_i [P(Y >= 4 | x_i, def_k = Sí) - P(Y >= 4 | x_i, def_k = No)], con
+# w_i = fexp_i / sum(fexp): todo el resto de cada persona se deja en su valor
+# observado (estandarización poblacional). Se reporta también el efecto sobre la
+# insatisfacción P(Y <= 2), que el PPO permite distinguir porque la humedad tiene
+# coeficientes distintos en los umbrales bajos y altos.
+# Varianza: método delta (gradiente numérico central) con la matriz de diseño de cada
+# imputación; los 5 resultados se combinan con las Reglas de Rubin.
+
+# Posición de cada coeficiente para cada umbral: 'x:j' si es no paralelo, 'x' si es común
+indices_ppo <- function(coefs, columnas) {
+  sapply(1:4, function(j) vapply(columnas, function(cc) {
+    k <- match(paste0(cc, ':', j), names(coefs))
+    if (is.na(k)) match(cc, names(coefs)) else k
+  }, integer(1)))
+}
+# Versión rápida de predecir_ppo con la matriz de diseño ya construida
+prob_ppo_rapida <- function(coefs, X, idx) {
+  eta <- sapply(1:4, function(j) coefs[[paste0('(Intercept):', j)]] + drop(X %*% coefs[idx[, j]]))
+  S <- cbind(1, plogis(eta), 0)
+  S[, 1:5] - S[, 2:6]
+}
+ame_ppo_imputacion <- function(coefs, V, datos, v, nivel_con = 'Sí', nivel_sin = 'No') {
+  d_con <- d_sin <- datos
+  d_con[[v]][] <- nivel_con
+  d_sin[[v]][] <- nivel_sin
+  X_con <- model.matrix(reformulate(pred), d_con)[, -1, drop = FALSE]
+  X_sin <- model.matrix(reformulate(pred), d_sin)[, -1, drop = FALSE]
+  idx <- indices_ppo(coefs, colnames(X_con))
+  w <- datos$fexp / sum(datos$fexp)
+  efectos <- function(cf) {
+    P_con <- prob_ppo_rapida(cf, X_con, idx)
+    P_sin <- prob_ppo_rapida(cf, X_sin, idx)
+    c(alta = sum(w * (rowSums(P_con[, 4:5]) - rowSums(P_sin[, 4:5]))),
+      baja = sum(w * (rowSums(P_con[, 1:2]) - rowSums(P_sin[, 1:2]))),
+      p_sin = sum(w * rowSums(P_sin[, 4:5])),
+      p_con = sum(w * rowSums(P_con[, 4:5])))
+  }
+  est <- efectos(coefs)
+  h <- 1e-6
+  G <- sapply(seq_along(coefs), function(k) {
+    e <- replace(numeric(length(coefs)), k, h)
+    (efectos(coefs + e) - efectos(coefs - e)) / (2 * h)
+  })
+  list(est = est, var = G %*% V %*% t(G))
+}
+
+ame_ppo <- do.call(rbind, lapply(def, function(v) {
+  por_imp <- lapply(seq_along(ppo_imp), function(i) {
+    ame_ppo_imputacion(ppo_imp[[i]]$coef, ppo_imp[[i]]$var, disenos_imp[[i]]$variables, v)
+  })
+  comb <- mitools::MIcombine(lapply(por_imp, `[[`, 'est'), lapply(por_imp, `[[`, 'var'))
+  est <- coef(comb); ee <- sqrt(diag(vcov(comb)))
+  z <- qt(0.975, df = pmin(comb$df, gl_diseno))
+  data.frame(
+    Codigo = v, Deficiencia = nombre_var[[v]],
+    Prob_Sin = 100 * est[['p_sin']], Prob_Con = 100 * est[['p_con']],
+    AME_alta_pp = 100 * est[['alta']],
+    LI_alta = 100 * (est[['alta']] - z[1] * ee[['alta']]),
+    LS_alta = 100 * (est[['alta']] + z[1] * ee[['alta']]),
+    AME_baja_pp = 100 * est[['baja']],
+    LI_baja = 100 * (est[['baja']] - z[2] * ee[['baja']]),
+    LS_baja = 100 * (est[['baja']] + z[2] * ee[['baja']]),
+    row.names = NULL
+  )
+}))
+
+# Brecha ajustada del Maule con el PPO (modelo final): toda la población evaluada
+# como si viviera en el Maule vs. como si viviera en el resto del país.
+maule_por_imp <- lapply(seq_along(ppo_imp), function(i) {
+  ame_ppo_imputacion(ppo_imp[[i]]$coef, ppo_imp[[i]]$var, disenos_imp[[i]]$variables, 'territorio',
+                     nivel_con = 'Maule', nivel_sin = 'Resto del país')
+})
+comb_maule <- mitools::MIcombine(lapply(maule_por_imp, `[[`, 'est'), lapply(maule_por_imp, `[[`, 'var'))
+z_maule <- qt(0.975, df = pmin(comb_maule$df, gl_diseno))
+brecha_maule_ppo <- data.frame(
+  Escenario = 'Ajustado (PPO, modelo final; Rubin m = 5)',
+  Maule_Pct = 100 * coef(comb_maule)[['p_con']], Resto_Pct = 100 * coef(comb_maule)[['p_sin']],
+  Diferencia_pp = 100 * coef(comb_maule)[['alta']],
+  LI_95 = 100 * (coef(comb_maule)[['alta']] - z_maule[1] * sqrt(diag(vcov(comb_maule)))[['alta']]),
+  LS_95 = 100 * (coef(comb_maule)[['alta']] + z_maule[1] * sqrt(diag(vcov(comb_maule)))[['alta']])
+)
+tabla_comparacion_maule <- rbind(tabla_comparacion_maule, brecha_maule_ppo)
+```
+
+## 5. Ranking Regional, Mapas y Comparación por Macrozonas
+
+```{r paso5-ranking-mapas-y-macrozonas}
+# ==============================================================================
+# ETAPA 5: PUNTUACIÓN REGIONAL, MAPA DE CHILE Y MACROZONAS
+# ==============================================================================
+
+# Análisis de Dominancia General / Valor de Shapley (Luchman, 2014) sobre el PPO.
+# Se ajustan los 2^6 = 64 submodelos PPO (todas las combinaciones de deficiencias,
+# con los 18 controles siempre presentes) en cada una de las 5 bases imputadas:
+# 64 x 5 = 320 ajustes. Cada submodelo conserva la especificación del modelo final:
+# las variables no paralelas presentes en él siguen liberadas por umbral.
+# Medida de ajuste: R2 de McFadden ponderado, 1 - LL(submodelo) / LL(nulo), con
+# pesos fexp normalizados a media 1. Para ponderar solo se necesita la estimación
+# puntual del ajuste, por lo que se usa VGAM::vglm ponderado (sin varianza de diseño).
+
+datos_shapley <- lapply(disenos_imp, function(dis) dis$variables[c('y', pred, 'fexp')])
+
+ajustar_submodelo_ppo <- function(mascara, datos, def, controles, vars_no_paralelas) {
+  incluidas <- def[as.logical(intToBits(mascara)[1:6])]
+  vars <- c(incluidas, controles)
+  libres <- intersect(vars_no_paralelas, vars)
+  restriccion <- if (length(libres)) as.formula(paste('FALSE ~', paste(libres, collapse = ' + '))) else TRUE
+  datos$w_norm <- datos$fexp / mean(datos$fexp)
+  ajuste <- suppressWarnings(VGAM::vglm(
+    reformulate(vars, response = 'y'),
+    family = VGAM::cumulative(link = 'logitlink', reverse = TRUE, parallel = restriccion),
+    data = datos, weights = w_norm
+  ))
+  P <- ajuste@fitted.values
+  c(ll = sum(datos$w_norm * log(P[cbind(seq_len(nrow(datos)), as.integer(datos$y))])),
+    min_p = min(P))
+}
+
+# Los 320 ajustes tardan varios minutos: se paralelizan y se guardan en caché, que
+# solo se recalcula si cambian los datos imputados o la especificación.
+ruta_cache_shapley <- 'cache_shapley_ppo.rds'
+firma_shapley <- list(datos = datos_shapley, def = def, controles = controles,
+                      no_paralelas = vars_no_paralelas)
+cache_shapley <- if (file.exists(ruta_cache_shapley)) readRDS(ruta_cache_shapley) else NULL
+
+if (!is.null(cache_shapley) && identical(cache_shapley$firma, firma_shapley)) {
+  ll_submodelos <- cache_shapley$ll
+} else {
+  grilla <- expand.grid(mascara = 0:63, imputacion = seq_along(datos_shapley))
+  n_nucleos <- max(1, min(7, parallel::detectCores() - 1))
+  cl <- parallel::makeCluster(n_nucleos)
+  res_grilla <- tryCatch({
+    parallel::clusterExport(cl, c('datos_shapley', 'ajustar_submodelo_ppo', 'def', 'controles',
+                                  'vars_no_paralelas', 'grilla'), envir = environment())
+    parallel::parLapplyLB(cl, seq_len(nrow(grilla)), function(r) {
+      ajustar_submodelo_ppo(grilla$mascara[r], datos_shapley[[grilla$imputacion[r]]],
+                            def, controles, vars_no_paralelas)
+    })
+  }, finally = parallel::stopCluster(cl))
+  ll_submodelos <- cbind(grilla, do.call(rbind, res_grilla))
+  saveRDS(list(firma = firma_shapley, ll = ll_submodelos), ruta_cache_shapley)
+}
+stopifnot(all(ll_submodelos$min_p > 0))   # todos los submodelos con probabilidades válidas
+
+# Log-verosimilitud nula (solo umbrales) de cada imputación y R2 de McFadden
+ll_nulo_imp <- vapply(datos_shapley, function(d) {
+  w <- d$fexp / mean(d$fexp)
+  prior <- prop.table(tapply(w, d$y, sum))
+  sum(w * log(prior[as.integer(d$y)]))
+}, numeric(1))
+ll_submodelos$r2 <- 1 - ll_submodelos$ll / ll_nulo_imp[ll_submodelos$imputacion]
+
+# Dominancia general: para cada deficiencia, promedio (sobre los tamaños k = 0..5)
+# del aumento medio de R2 al agregarla a los submodelos de tamaño k que no la tienen.
+dominancia_general <- function(r2) {
+  vapply(seq_len(6), function(j) {
+    sin_j <- (0:63)[bitwAnd(0:63, bitwShiftL(1, j - 1)) == 0]
+    tam <- vapply(sin_j, function(m) sum(as.integer(intToBits(m)[1:6])), integer(1))
+    mean(vapply(0:5, function(k) {
+      ss <- sin_j[tam == k]
+      mean(r2[ss + bitwShiftL(1, j - 1) + 1] - r2[ss + 1])
+    }, numeric(1)))
+  }, numeric(1))
+}
+aportes_por_imp <- sapply(seq_along(datos_shapley), function(i) {
+  r2_i <- ll_submodelos$r2[ll_submodelos$imputacion == i][order(ll_submodelos$mascara[ll_submodelos$imputacion == i])]
+  dominancia_general(r2_i)
+})
+rownames(aportes_por_imp) <- def
+pesos_por_imp <- 100 * sweep(aportes_por_imp, 2, colSums(aportes_por_imp), '/')
+
+# Peso final de cada deficiencia: promedio sobre las 5 imputaciones
+aportes_dominancia <- rowMeans(aportes_por_imp)
+pesos_deficiencias <- 100 * aportes_dominancia / sum(aportes_dominancia)
+
+r2_completo <- mean(ll_submodelos$r2[ll_submodelos$mascara == 63])
+r2_controles <- mean(ll_submodelos$r2[ll_submodelos$mascara == 0])
+tabla_pesos_ppo <- data.frame(
+  Codigo = def, Deficiencia = unname(nombre_var[def]),
+  Aporte_R2 = aportes_dominancia,
+  Peso_Pct = pesos_deficiencias,
+  Peso_Min = apply(pesos_por_imp, 1, min),
+  Peso_Max = apply(pesos_por_imp, 1, max),
+  row.names = NULL
+)
+tabla_pesos_ppo <- merge(tabla_pesos_ppo, ame_ppo[c('Codigo', 'AME_alta_pp', 'AME_baja_pp')], by = 'Codigo')
+tabla_pesos_ppo <- tabla_pesos_ppo[order(-tabla_pesos_ppo$Peso_Pct), ]
+tabla_pesos_ppo$Ranking <- seq_len(nrow(tabla_pesos_ppo))
+
+# (El índice regional y el doble ranking se construyen en la etapa 10, cuando ya
+#  están disponibles los pesos PPO y los pesos XGBoost.)
+
+# ------------------------------------------------------------------------------
+# Comparación Formal entre Macrozonas (Norte, Centro, Sur)
+# ------------------------------------------------------------------------------
+dis_macro <- diseno_completo
+dis_macro$variables$sat_alta_num <- as.numeric(as.integer(dis_macro$variables$y) >= 4)
+
+# Medias ponderadas de satisfacción por macrozona
+media_macrozona <- survey::svyby(~sat_alta_num, ~macrozona, dis_macro, survey::svymean)
+
+# Contraste de hipótesis formal entre Macrozonas mediante regresión de diseño
+modelo_macro <- survey::svyglm(sat_alta_num ~ macrozona, design = dis_macro, family = quasibinomial())
+wald_macro <- survey::regTermTest(modelo_macro, ~macrozona, method = 'Wald')
+
+tabla_macrozona <- data.frame(
+  Macrozona = media_macrozona$macrozona,
+  n_casos = as.numeric(table(d_analitica$macrozona)[media_macrozona$macrozona]),
+  Satisfaccion_Alta_Pct = 100 * media_macrozona$sat_alta_num,
+  EE = 100 * media_macrozona$se,
+  LI_95 = 100 * (media_macrozona$sat_alta_num - crit_t * media_macrozona$se),
+  LS_95 = 100 * (media_macrozona$sat_alta_num + crit_t * media_macrozona$se)
+)
+
+# ------------------------------------------------------------------------------
+# Preparación del Mapa Cartográfico de Chile
+# ------------------------------------------------------------------------------
+mapa_sf <- chilemapas::generar_regiones()
+
+# Acotamos coordenadas para excluir territorio antártico e islas oceánicas
+mapa_continental <- suppressWarnings(
+  sf::st_crop(mapa_sf, xmin = -76, ymin = -56, xmax = -66, ymax = -17)
+)
+```
+
+## 6. Repartición Train/Test e Imputación sin Fuga de Información
+
+```{r paso7-particion-e-imputacion}
+# ==============================================================================
+# ETAPA 7: PARTICIÓN 80/20 POR CONGLOMERADOS SOBRE LA BASE COMPLETA (N = 11.234)
+# ==============================================================================
+# Unidad de partición: el CONGLOMERADO (UPM). Las personas de un mismo conglomerado
+# comparten vecindario y se parecen entre sí; si quedaran repartidas entre
+# entrenamiento y prueba, la prueba sería optimista (fuga de información vecinal).
+# Estratos de partición: estrato de diseño × "el conglomerado tiene al menos una
+# persona insatisfecha (Y <= 2)", para que ambas partes conserven la composición
+# territorial y la proporción de las categorías minoritarias.
+semilla_particion <- 2026L
+b$.conglomerado <- paste(b$estrato_ebs, b$varunit, sep = '_')   # varunit se numera dentro del estrato
+
+conglos <- unique(b[c('.conglomerado', 'estrato_ebs')])
+insat_conglo <- tapply(as.integer(b$y) <= 2, b$.conglomerado, function(z) any(z, na.rm = TRUE))
+conglos$estrato_particion <- paste(conglos$estrato_ebs, insat_conglo[conglos$.conglomerado], sep = '_')
+
+set.seed(semilla_particion)
+conglos$conjunto <- 'Entrenamiento'
+for (s in unique(conglos$estrato_particion)) {
+  i <- which(conglos$estrato_particion == s)
+  n_prueba <- if (length(i) == 1) rbinom(1, 1, 0.20) else round(0.20 * length(i))
+  if (n_prueba > 0) conglos$conjunto[i[sample.int(length(i), n_prueba)]] <- 'Prueba'
+}
+b$conjunto <- conglos$conjunto[match(b$.conglomerado, conglos$.conglomerado)]
+es_prueba <- b$conjunto == 'Prueba'
+
+# Blindaje: ningún conglomerado puede aparecer en ambas partes
+stopifnot(!anyNA(b$conjunto),
+          length(intersect(b$.conglomerado[es_prueba], b$.conglomerado[!es_prueba])) == 0)
+
+resumen_particion <- data.frame(
+  Conjunto = c('Entrenamiento', 'Prueba'),
+  Personas = c(sum(!es_prueba), sum(es_prueba)),
+  Conglomerados = c(sum(conglos$conjunto == 'Entrenamiento'), sum(conglos$conjunto == 'Prueba')),
+  Estratos = c(length(unique(b$estrato_ebs[!es_prueba])), length(unique(b$estrato_ebs[es_prueba]))),
+  Pct_Personas = 100 * c(mean(!es_prueba), mean(es_prueba)),
+  Pct_Poblacion = 100 * c(sum(b$fexp[!es_prueba]), sum(b$fexp[es_prueba])) / sum(b$fexp)
+)
+dist_particion <- sapply(c(Entrenamiento = FALSE, Prueba = TRUE), function(p) {
+  sel <- es_prueba == p & !is.na(b$y)
+  100 * tapply(b$fexp[sel], b$y[sel], sum) / sum(b$fexp[sel])
+})
+
+# Archivo compartido para que XGBoost use EXACTAMENTE la misma partición
+write.csv(data.frame(id_fila = b$id_fila, conglomerado = b$.conglomerado, conjunto = b$conjunto),
+          'particion_compartida_imputada.csv', row.names = FALSE, fileEncoding = 'UTF-8')
+
+# ------------------------------------------------------------------------------
+# Imputación MICE sin fuga: el modelo de imputación se ajusta SOLO con entrenamiento
+# ------------------------------------------------------------------------------
+# - ignore = es_prueba: las filas de prueba se imputan, pero no participan en la
+#   estimación de los modelos de imputación (van Buuren, 2018, sec. 6.4).
+# - La Y de prueba se enmascara (NA) antes de imputar: si se usara, los faltantes de
+#   X en la prueba se imputarían con información de su propia respuesta, lo que es
+#   una fuga. Después de imputar se restituye la Y observada solo para evaluar.
+# Mismos métodos, variables auxiliares y matriz de predictores que en la etapa 2.
+datos_imp_particion <- datos_imp_in
+datos_imp_particion$y[es_prueba] <- NA
+
+ruta_cache_mice_part <- 'cache_mice_particion.rds'
+cache_part <- if (file.exists(ruta_cache_mice_part)) readRDS(ruta_cache_mice_part) else NULL
+if (!is.null(cache_part) && identical(cache_part$datos, datos_imp_particion) &&
+    identical(cache_part$ignore, es_prueba) && identical(cache_part$metodos, metodos_mice)) {
+  imp_particion <- cache_part$imp
+} else {
+  if (requireNamespace('future', quietly = TRUE) && requireNamespace('furrr', quietly = TRUE)) {
+    imp_particion <- mice::futuremice(datos_imp_particion, m = 5, maxit = 10, method = metodos_mice,
+                                      predictorMatrix = matriz_pred_mice, ignore = es_prueba,
+                                      n.core = min(5, max(1, parallel::detectCores() - 1)),
+                                      parallelseed = 20261113)
+  } else {
+    imp_particion <- mice::mice(datos_imp_particion, m = 5, maxit = 10, method = metodos_mice,
+                                predictorMatrix = matriz_pred_mice, ignore = es_prueba,
+                                printFlag = FALSE, seed = 20261113)
+  }
+  saveRDS(list(datos = datos_imp_particion, ignore = es_prueba, metodos = metodos_mice,
+               imp = imp_particion), ruta_cache_mice_part)
+}
+
+completar_particion <- function(i) {
+  df_i <- b
+  imp_i <- mice::complete(imp_particion, i)[vars_mice]
+  for (v in vars_ordinales_mice) imp_i[[v]] <- factor(as.character(imp_i[[v]]), levels = levels(b[[v]]))
+  df_i[vars_mice] <- imp_i
+  df_i$y[es_prueba] <- b$y[es_prueba]        # Y observada de prueba (NA si no respondió)
+  df_i
+}
+datos_particion <- lapply(seq_len(imp_particion$m), completar_particion)
+# Diseño construido SOLO con las filas de entrenamiento (no con subset(), que deja las
+# filas de prueba con peso casi nulo dentro de svy_vglm).
+disenos_train <- lapply(datos_particion, function(d) {
+  survey::svydesign(ids = ~varunit, strata = ~estrato_ebs, weights = ~fexp, nest = TRUE,
+                    data = d[d$conjunto == 'Entrenamiento', ])
+})
+```
+
+## 7. Modelo PPO en la Repartición: Estabilidad y Evaluación Fuera de Muestra
+
+```{r paso8-ppo-particion}
+# ==============================================================================
+# ETAPA 8: PPO EN ENTRENAMIENTO (80 %) Y EVALUACIÓN EN PRUEBA (20 %)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 8a. Estabilidad del rechazo del paralelismo en el entrenamiento
+# ------------------------------------------------------------------------------
+# Mismo test de Wald de diseño de la etapa 3b (logits binarios acumulados con
+# funciones de influencia apiladas), sobre los casos completos de entrenamiento.
+test_paralelismo <- function(diseno) {
+  gl <- survey::degf(diseno)
+  binarios <- lapply(1:4, function(j) {
+    dj <- update(diseno, supera = as.integer(y) > j)
+    survey::svyglm(reformulate(pred, response = 'supera'), design = dj,
+                   family = quasibinomial(), influence = TRUE)
+  })
+  infl <- do.call(cbind, lapply(binarios, function(m) attr(m, 'influence')))
+  V <- survey::svyrecvar(infl, diseno$cluster, diseno$strata, diseno$fpc,
+                         postStrata = diseno$postStrata, lonely.psu = 'adjust')
+  bc <- unlist(lapply(binarios, coef), use.names = FALSE)
+  p_bin <- length(coef(binarios[[1]]))
+  wald <- function(k) {
+    C <- matrix(0, 3 * length(k), length(bc)); r <- 0
+    for (j in 2:4) for (h in k) { r <- r + 1; C[r, h] <- -1; C[r, (j - 1) * p_bin + h] <- 1 }
+    u <- as.vector(C %*% bc); S <- C %*% V %*% t(C)
+    e <- eigen(S, symmetric = TRUE); keep <- e$values > max(e$values) * 1e-9
+    W <- sum((crossprod(e$vectors[, keep, drop = FALSE], u))^2 / e$values[keep]); q <- sum(keep)
+    c(F_stat = W / q, gl1 = q, gl2 = gl, p = pf(W / q, q, gl, lower.tail = FALSE))
+  }
+  asg <- attr(model.matrix(reformulate(pred), diseno$variables), 'assign')[-1]
+  data.frame(Codigo = c('Global', pred),
+             t(sapply(c(list(2:p_bin), lapply(seq_along(pred), function(j) which(asg == j) + 1)), wald)))
+}
+
+diseno_cc_train <- survey::svydesign(ids = ~varunit, strata = ~estrato_ebs, weights = ~fexp, nest = TRUE,
+                                     data = b[b$completo & b$conjunto == 'Entrenamiento', ])
+paralelismo_train <- test_paralelismo(diseno_cc_train)
+estabilidad_paralelismo <- data.frame(
+  Variable = c('Global (Omnibus)', unname(nombre_var[pred])),
+  p_Completa = res_paralelismo$p,
+  p_Entrenamiento = paralelismo_train$p,
+  Decision_Completa = ifelse(res_paralelismo$p < alpha_ppo, 'Rechaza', 'No rechaza'),
+  Decision_Entrenamiento = ifelse(paralelismo_train$p < alpha_ppo, 'Rechaza', 'No rechaza')
+)
+estabilidad_paralelismo$Coincide <- with(estabilidad_paralelismo, Decision_Completa == Decision_Entrenamiento)
+
+# ------------------------------------------------------------------------------
+# 8b. Especificación del PPO elegida SOLO con el entrenamiento
+# ------------------------------------------------------------------------------
+# Se aplica la misma regla de la etapa 3c (selección hacia adelante: liberar un
+# candidato solo si el PPO sigue válido y su Wald en el PPO es significativo), pero
+# usando únicamente el entrenamiento. Así la prueba no interviene ni siquiera en la
+# elección de qué predictores son no paralelos.
+gl_train <- survey::degf(diseno_cc_train)
+cand_train_tab <- data.frame(Codigo = pred, p = paralelismo_train$p[-1])
+cand_train_tab <- cand_train_tab[cand_train_tab$p < alpha_ppo, ]
+cand_train_tab <- cand_train_tab[order(cand_train_tab$p), ]
+vars_no_paralelas_train <- character(0)
+traza_train <- list()
+for (v in cand_train_tab$Codigo) {
+  aj_v <- ajustar_ppo(c(vars_no_paralelas_train, v), diseno_cc_train)
+  ok_v <- ppo_valido(aj_v, diseno_cc_train$variables)
+  p_v <- if (ok_v) wald_umbrales(aj_v$coef, aj_v$var, v, gl_train)[['p']] else NA
+  acepta_v <- ok_v && p_v < alpha_ppo
+  traza_train[[v]] <- data.frame(
+    Variable = nombre_var[[v]], p_test = cand_train_tab$p[cand_train_tab$Codigo == v],
+    Min_Prob = min(predecir_ppo(aj_v$coef, diseno_cc_train$variables)), Valido = ok_v, p_PPO = p_v,
+    Decision = ifelse(acepta_v, 'Liberado (no paralelo)',
+                      ifelse(ok_v, 'Paralelo (no significativo en el PPO)', 'Paralelo (liberarlo cruza los umbrales)'))
+  )
+  if (acepta_v) vars_no_paralelas_train <- c(vars_no_paralelas_train, v)
+}
+tabla_seleccion_train <- do.call(rbind, traza_train)
+
+# ------------------------------------------------------------------------------
+# 8c. PPO re-estimado en entrenamiento (5 imputaciones) + Rubin
+# ------------------------------------------------------------------------------
+ppo_train_imp <- lapply(disenos_train, function(dis) ajustar_ppo(vars_no_paralelas_train, dis))
+ppo_train_validos <- mapply(function(aj, dis) ppo_valido(aj, dis$variables), ppo_train_imp, disenos_train)
+stopifnot(all(ppo_train_validos))
+rubin_ppo_train <- mitools::MIcombine(lapply(ppo_train_imp, `[[`, 'coef'), lapply(ppo_train_imp, `[[`, 'var'))
+coef_ppo_train <- coef(rubin_ppo_train)
+
+# Comparación de los coeficientes de las deficiencias: muestra completa vs. entrenamiento
+terminos_def <- intersect(grep(paste0('^(', paste(def, collapse = '|'), ')Sí'), names(coef_ppo), value = TRUE),
+                          names(coef_ppo_train))
+estabilidad_coef <- data.frame(
+  Termino = terminos_def,
+  Beta_Completa = coef_ppo[terminos_def],
+  Beta_Entrenamiento = coef_ppo_train[terminos_def],
+  EE_Entrenamiento = sqrt(diag(vcov(rubin_ppo_train)))[terminos_def],
+  row.names = NULL
+)
+
+# ------------------------------------------------------------------------------
+# 8d. Evaluación predictiva en la prueba independiente (20 %)
+# ------------------------------------------------------------------------------
+# Probabilidades de prueba: promedio de las predicciones sobre las 5 versiones
+# imputadas de las X de prueba. Solo se evalúa a quienes tienen Y observada.
+eval_prueba <- es_prueba & !is.na(b$y)
+P_test_imp <- lapply(datos_particion, function(d) predecir_ppo(coef_ppo_train, d[eval_prueba, ]))
+P_test_ppo <- Reduce(`+`, P_test_imp) / length(P_test_imp)
+validez_prueba_ppo <- c(min = min(unlist(P_test_imp)), max = max(unlist(P_test_imp)))
+y_te <- as.integer(b$y[eval_prueba])
+fx_te <- b$fexp[eval_prueba]
+
+# Funciones de evaluación IDÉNTICAS a las del Rmd de XGBoost (comparabilidad)
+matriz_confusion_fexp <- function(real, pred, w, K = 5) {
+  stats::xtabs(w ~ factor(real, levels = 1:K) + factor(pred, levels = 1:K))
+}
+calcular_qwk <- function(real, pred, w, K = 5) {
+  O <- matriz_confusion_fexp(real, pred, w, K)
+  E <- outer(rowSums(O), colSums(O)) / sum(O)
+  W <- outer(1:K, 1:K, function(a, b) (a - b)^2 / (K - 1)^2)
+  den <- sum(W * E)
+  if (!is.finite(den) || den <= 0) return(0)
+  1 - sum(W * O) / den
+}
+auc_ponderado <- function(score, y_bin, w) {
+  ord <- order(score, decreasing = TRUE)
+  s <- score[ord]; p <- y_bin[ord]; ww <- w[ord]
+  tp <- cumsum(ww * p) / sum(ww * p); fp <- cumsum(ww * (1 - p)) / sum(ww * (1 - p))
+  ult <- c(diff(s) != 0, TRUE)
+  tp <- c(0, tp[ult]); fp <- c(0, fp[ult])
+  sum(diff(fp) * (head(tp, -1) + tail(tp, -1)) / 2)
+}
+metricas <- function(pred, nombre) {
+  M <- matriz_confusion_fexp(y_te, pred, fx_te)
+  sens <- as.numeric(diag(M) / rowSums(M))
+  data.frame(Modelo = nombre,
+             Exactitud = 100 * sum(fx_te * (y_te == pred)) / sum(fx_te),
+             Exactitud_Balanceada = 100 * mean(sens),
+             QWK = calcular_qwk(y_te, pred, fx_te),
+             Sens_1 = 100 * sens[1], Sens_2 = 100 * sens[2], Sens_3 = 100 * sens[3],
+             Sens_4 = 100 * sens[4], Sens_5 = 100 * sens[5])
+}
+
+# Regla 1: clase más probable (argmax)
+pred_ppo_argmax <- max.col(P_test_ppo, ties.method = 'first')
+# Regla 2: balanceada (argmax de P_k / pi_k, con pi_k = prevalencia ponderada de la
+# clase k en ENTRENAMIENTO). Es el equivalente teórico de entrenar con pesos de
+# clase balanceados, como XGBoost; prioriza detectar las categorías minoritarias.
+pi_train <- prop.table(tapply(b$fexp[!es_prueba & !is.na(b$y)], b$y[!es_prueba & !is.na(b$y)], sum))
+pred_ppo_bal <- max.col(sweep(P_test_ppo, 2, as.numeric(pi_train), '/'), ties.method = 'first')
+# Línea base: clase modal (ponderada) del entrenamiento para todos
+clase_modal <- which.max(pi_train)
+pred_base <- rep(clase_modal, length(y_te))
+
+p_insat_ppo <- rowSums(P_test_ppo[, 1:2])
+auc_ppo <- auc_ponderado(p_insat_ppo, as.numeric(y_te <= 2), fx_te)
+
+tabla_metricas_ppo <- rbind(
+  metricas(pred_ppo_argmax, 'PPO – clase más probable'),
+  metricas(pred_ppo_bal, 'PPO – regla balanceada (P/π)'),
+  metricas(pred_base, paste0('Línea base – siempre «', respuestas[clase_modal], '»'))
+)
+tabla_metricas_ppo$AUC_Insatisfaccion <- c(auc_ppo, auc_ppo, 0.5)
+matriz_confusion_ppo_bal <- matriz_confusion_fexp(y_te, pred_ppo_bal, fx_te)
+```
+
+## 8. XGBoost: Validación Cruzada, Prueba Independiente y Muestra Completa
+
+```{r paso9-xgboost}
+# ==============================================================================
+# ETAPA 9: XGBOOST (CHEN & GUESTRIN, 2016) SOBRE LAS BASES IMPUTADAS
+# ==============================================================================
+# Imputación múltiple + XGBoost: se APILAN las 5 bases imputadas (cada persona
+# aparece 5 veces, con peso fexp/5) para entrenar, y se PROMEDIAN las probabilidades
+# predichas sobre las 5 versiones de cada persona para evaluar. Así el modelo
+# aprende de la incertidumbre de la imputación sin dar más peso a nadie.
+# Predictores: los mismos 24 del PPO (incluido hacinamiento con 3 niveles), en
+# codificación one-hot completa (una columna 0/1 por categoría, sin referencia).
+semilla_xgb <- 2026L
+hilos_xgb <- max(1L, parallel::detectCores() - 1L)
+
+contrastes_oh <- lapply(b[pred], function(x) stats::contrasts(x, contrasts = FALSE))
+one_hot <- function(datos) {
+  X <- stats::model.matrix(reformulate(pred, intercept = FALSE), data = datos[pred],
+                           contrasts.arg = contrastes_oh)
+  X
+}
+X_ref <- one_hot(b[!is.na(b[[pred[1]]]) & complete.cases(b[pred]), ][1:50, ])
+variable_columna <- pred[attr(X_ref, 'assign')]          # columna one-hot -> variable original
+names(variable_columna) <- colnames(X_ref)
+
+# Pesos: fexp normalizado; esquema balanceado = fexp × (1 / prevalencia de la clase),
+# el mismo criterio sensible al costo del Rmd de XGBoost (corrige el desbalance).
+pesos_balanceados <- function(y, fexp, K = 5) {
+  w <- fexp / mean(fexp)
+  masa <- tapply(w, factor(y, levels = 1:K), sum)
+  w <- w * (sum(w) / (K * masa))[y]
+  as.numeric(w / mean(w))
+}
+
+# Base apilada de una lista de data.frames imputados (filas seleccionadas)
+apilar <- function(lista_datos, filas) {
+  partes <- lapply(seq_along(lista_datos), function(i) {
+    d <- lista_datos[[i]][filas, ]
+    list(X = one_hot(d), y = as.integer(d$y), fexp = d$fexp / length(lista_datos),
+         id = d$id_fila, conglo = d$.conglomerado)
+  })
+  list(X = do.call(rbind, lapply(partes, `[[`, 'X')), y = unlist(lapply(partes, `[[`, 'y')),
+       fexp = unlist(lapply(partes, `[[`, 'fexp')), id = unlist(lapply(partes, `[[`, 'id')),
+       conglo = unlist(lapply(partes, `[[`, 'conglo')))
+}
+# Promedio de probabilidades sobre las copias imputadas de cada persona
+promediar_por_persona <- function(P, id) {
+  S <- rowsum(P, id, reorder = FALSE)
+  S / as.numeric(table(id)[rownames(S)])
+}
+entrenar_xgb <- function(X, y, w, cfg, nrounds, semilla = semilla_xgb) {
+  xgboost::xgb.train(
+    params = list(objective = 'multi:softprob', num_class = 5L, booster = 'gbtree', tree_method = 'hist',
+                  max_depth = cfg$max_depth, learning_rate = cfg$learning_rate,
+                  subsample = cfg$subsample, min_child_weight = cfg$min_child_weight,
+                  lambda = 1, alpha = 0, nthread = hilos_xgb, seed = semilla),
+    data = xgboost::xgb.DMatrix(X, label = y - 1L, weight = w), nrounds = nrounds, verbose = 0
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 9a. Validación cruzada de 5 pliegues por conglomerados dentro del entrenamiento
+# ------------------------------------------------------------------------------
+filas_train <- which(b$conjunto == 'Entrenamiento')
+tr <- apilar(datos_particion, filas_train)
+
+# Pliegues: conglomerados completos, repartidos dentro de cada estrato de partición
+k_pliegues <- 5L
+set.seed(semilla_xgb + 1L)
+conglos_tr <- conglos[conglos$conjunto == 'Entrenamiento', ]
+conglos_tr$pliegue <- NA_integer_
+desfase <- 0L
+for (s in sort(unique(conglos_tr$estrato_particion))) {
+  i <- which(conglos_tr$estrato_particion == s)
+  conglos_tr$pliegue[i] <- ((sample.int(length(i)) + desfase - 1L) %% k_pliegues) + 1L
+  desfase <- desfase + length(i)
+}
+pliegue_tr <- conglos_tr$pliegue[match(tr$conglo, conglos_tr$.conglomerado)]
+stopifnot(!anyNA(pliegue_tr))
+
+# Búsqueda aleatoria (Bergstra & Bengio, 2012) con rangos AMPLIADOS respecto del Rmd
+# de XGBoost, cuya profundidad óptima quedó en el borde (6) del rango explorado.
+set.seed(semilla_xgb + 2L)
+n_configs <- 24L
+max_rondas <- 400L
+grilla_rondas <- seq(25L, max_rondas, by = 25L)
+configuraciones_xgb <- data.frame(
+  config = sprintf('C%02d', seq_len(n_configs)),
+  max_depth = sample(2:9, n_configs, replace = TRUE),
+  learning_rate = round(10^runif(n_configs, log10(0.01), log10(0.25)), 4),
+  subsample = round(runif(n_configs, 0.6, 1.0), 2),
+  min_child_weight = round(10^runif(n_configs, log10(1), log10(30)), 1)
+)
+
+ruta_cache_xgb <- 'cache_xgboost_cv_imputado.rds'
+firma_xgb <- list(X = tr$X, y = tr$y, fexp = tr$fexp, pliegue = pliegue_tr, cfg = configuraciones_xgb,
+                  rondas = grilla_rondas)
+cache_xgb <- if (file.exists(ruta_cache_xgb)) readRDS(ruta_cache_xgb) else NULL
+if (!is.null(cache_xgb) && identical(cache_xgb$firma, firma_xgb)) {
+  cv_detalle_xgb <- cache_xgb$cv
+} else {
+  resultados <- list()
+  for (j in seq_len(n_configs)) {
+    cfg <- configuraciones_xgb[j, ]
+    for (k in seq_len(k_pliegues)) {
+      aj <- pliegue_tr != k; va <- pliegue_tr == k
+      modelo_k <- entrenar_xgb(tr$X[aj, ], tr$y[aj], pesos_balanceados(tr$y[aj], tr$fexp[aj]),
+                               cfg, max_rondas, semilla_xgb + k)
+      dval <- xgboost::xgb.DMatrix(tr$X[va, ])
+      # Una fila por persona de validación (Y observada, sin imputar)
+      id_va <- tr$id[va]
+      y_va <- as.integer(b$y[match(unique(id_va), b$id_fila)])
+      w_va <- b$fexp[match(unique(id_va), b$id_fila)]
+      obs <- !is.na(y_va)
+      for (nr in grilla_rondas) {
+        P <- promediar_por_persona(predict(modelo_k, dval, iterationrange = c(1L, nr)), id_va)
+        pred_va <- max.col(P, ties.method = 'first')
+        resultados[[length(resultados) + 1L]] <- data.frame(
+          config = cfg$config, pliegue = k, n_estimators = nr,
+          qwk = calcular_qwk(y_va[obs], pred_va[obs], w_va[obs]))
+      }
+    }
+  }
+  cv_detalle_xgb <- do.call(rbind, resultados)
+  saveRDS(list(firma = firma_xgb, cv = cv_detalle_xgb), ruta_cache_xgb)
+}
+cv_resumen_xgb <- aggregate(qwk ~ config + n_estimators, data = cv_detalle_xgb,
+                            FUN = function(z) c(media = mean(z), de = sd(z)))
+cv_resumen_xgb <- data.frame(cv_resumen_xgb[1:2], qwk_media = cv_resumen_xgb$qwk[, 'media'],
+                             qwk_de = cv_resumen_xgb$qwk[, 'de'])
+cv_resumen_xgb <- merge(cv_resumen_xgb, configuraciones_xgb, by = 'config')
+cv_resumen_xgb <- cv_resumen_xgb[order(-cv_resumen_xgb$qwk_media), ]
+mejor_xgb <- cv_resumen_xgb[1, ]
+
+# ------------------------------------------------------------------------------
+# 9b. Modelo final en todo el entrenamiento y evaluación en la prueba independiente
+# ------------------------------------------------------------------------------
+modelo_xgb_train <- entrenar_xgb(tr$X, tr$y, pesos_balanceados(tr$y, tr$fexp), mejor_xgb,
+                                 mejor_xgb$n_estimators)
+te_xgb <- apilar(datos_particion, which(eval_prueba))
+P_test_xgb <- promediar_por_persona(predict(modelo_xgb_train, xgboost::xgb.DMatrix(te_xgb$X)), te_xgb$id)
+P_test_xgb <- P_test_xgb[as.character(b$id_fila[eval_prueba]), ]   # mismo orden que y_te
+pred_xgb <- max.col(P_test_xgb, ties.method = 'first')
+auc_xgb <- auc_ponderado(rowSums(P_test_xgb[, 1:2]), as.numeric(y_te <= 2), fx_te)
+
+tabla_comparacion_test <- rbind(
+  metricas(pred_ppo_bal, 'PPO (regla balanceada)'),
+  metricas(pred_xgb, 'XGBoost (pesos balanceados)'),
+  metricas(pred_base, paste0('Línea base – siempre «', respuestas[clase_modal], '»'))
+)
+tabla_comparacion_test$AUC_Insatisfaccion <- c(auc_ppo, auc_xgb, 0.5)
+matriz_confusion_xgb <- matriz_confusion_fexp(y_te, pred_xgb, fx_te)
+
+# Matrices de confusión en formato largo: % de cada categoría REAL (fila) que se
+# predice en cada categoría (la diagonal es la sensibilidad de esa categoría)
+confusion_larga <- function(M, modelo) {
+  P <- 100 * sweep(as.matrix(M), 1, rowSums(M), '/')
+  data.frame(Modelo = modelo,
+             Real = factor(rep(seq_len(5), times = 5), levels = 5:1),
+             Predicha = factor(rep(seq_len(5), each = 5), levels = 1:5),
+             Pct = as.vector(P))
+}
+confusion_ambos <- rbind(confusion_larga(matriz_confusion_ppo_bal, 'PPO (regla balanceada)'),
+                         confusion_larga(matriz_confusion_xgb, 'XGBoost (pesos balanceados)'))
+
+# Curvas ROC ponderadas por fexp para la alerta de insatisfacción (Y <= 2): mismos
+# puntos de corte que auc_ponderado(), para que el área del gráfico sea el AUC informado
+roc_ponderada <- function(score, y_bin, w, modelo) {
+  ord <- order(score, decreasing = TRUE)
+  s <- score[ord]; p <- y_bin[ord]; ww <- w[ord]
+  tp <- cumsum(ww * p) / sum(ww * p); fp <- cumsum(ww * (1 - p)) / sum(ww * (1 - p))
+  ult <- c(diff(s) != 0, TRUE)
+  data.frame(Modelo = modelo, FPR = c(0, fp[ult]), TPR = c(0, tp[ult]))
+}
+roc_ambos <- rbind(
+  roc_ponderada(p_insat_ppo, as.numeric(y_te <= 2), fx_te,
+                sprintf('PPO (AUC = %s)', fx(auc_ppo, 3))),
+  roc_ponderada(rowSums(P_test_xgb[, 1:2]), as.numeric(y_te <= 2), fx_te,
+                sprintf('XGBoost (AUC = %s)', fx(auc_xgb, 3)))
+)
+
+# Diferencia de AUC PPO - XGBoost con IC bootstrap por conglomerados de prueba
+set.seed(semilla_xgb + 3L)
+conglo_te <- b$.conglomerado[eval_prueba]
+lista_conglo <- split(seq_along(conglo_te), conglo_te)
+dif_auc_boot <- replicate(500, {
+  idx <- unlist(lista_conglo[sample.int(length(lista_conglo), replace = TRUE)], use.names = FALSE)
+  auc_ponderado(p_insat_ppo[idx], as.numeric(y_te[idx] <= 2), fx_te[idx]) -
+    auc_ponderado(rowSums(P_test_xgb[idx, 1:2]), as.numeric(y_te[idx] <= 2), fx_te[idx])
+})
+ic_dif_auc <- quantile(dif_auc_boot, c(0.025, 0.975))
+
+# ------------------------------------------------------------------------------
+# 9c. XGBoost en TODA la base (100 %): ganancia global de las variables
+# ------------------------------------------------------------------------------
+# Con la configuración elegida por validación cruzada, se reentrena con las 5 bases
+# imputadas completas (N = 11.234 × 5) para describir la importancia con toda la
+# información. Este modelo no se evalúa (no tiene prueba): solo aporta los pesos Gain.
+datos_completos_imp <- lapply(disenos_imp, `[[`, 'variables')
+todo <- apilar(datos_completos_imp, seq_len(nrow(b)))
+modelo_xgb_total <- entrenar_xgb(todo$X, todo$y, pesos_balanceados(todo$y, todo$fexp), mejor_xgb,
+                                 mejor_xgb$n_estimators)
+
+gain_por_variable <- function(modelo) {
+  imp <- xgboost::xgb.importance(model = modelo)
+  g <- tapply(imp$Gain, factor(variable_columna[imp$Feature], levels = pred), sum)
+  g[is.na(g)] <- 0
+  g
+}
+gain_total <- gain_por_variable(modelo_xgb_total)
+gain_train <- gain_por_variable(modelo_xgb_train)
+
+tabla_importancia_xgb <- data.frame(
+  Variable = pred, Nombre = unname(nombre_var[pred]),
+  Gain = as.numeric(gain_total),
+  Pct_Gain = 100 * as.numeric(gain_total) / sum(gain_total),
+  Pct_Gain_Train = 100 * as.numeric(gain_train) / sum(gain_train),
+  Tipo = ifelse(pred %in% def, 'Deficiencia Constructiva', 'Control Sociodemográfico / Entorno'),
+  stringsAsFactors = FALSE
+)
+tabla_importancia_xgb <- tabla_importancia_xgb[order(-tabla_importancia_xgb$Pct_Gain), ]
+
+# Pesos XGBoost de las 6 deficiencias: Gain relativo dentro de las deficiencias
+gain_def <- gain_total[def]
+pct_gain_def <- 100 * gain_def / sum(gain_def)
+pct_gain_def_train <- 100 * gain_train[def] / sum(gain_train[def])
+
+tabla_convergencia_def <- data.frame(
+  Deficiencia = unname(nombre_var[def]),
+  AME_PPO_pp = ame_ppo$AME_alta_pp[match(def, ame_ppo$Codigo)],
+  Dominancia_Logit_Pct = unname(pesos_deficiencias[def]),
+  Ganancia_XGBoost_Pct = unname(pct_gain_def[def])
+)
+tabla_convergencia_def <- tabla_convergencia_def[order(-tabla_convergencia_def$Dominancia_Logit_Pct), ]
+```
+
+## 9. Doble Ranking Regional y Cartografía por Macrozona
+
+```{r paso10-doble-ranking-y-mapas}
+# ==============================================================================
+# ETAPA 10: ÍNDICES DE DÉFICIT PPO Y XGBOOST, DOBLE RANKING Y MAPAS POR MACROZONA
+# ==============================================================================
+# Índice de la región r con pesos W_k (suman 1):   I_r = 100 × sum_k W_k × pi_rk
+# Equivale a la media regional del puntaje individual 100 × sum_k W_k × D_ik, por
+# lo que se estima con svyby (diseño complejo, base imputada) y se combinan las 5
+# imputaciones con Rubin. Los pesos se tratan como fijos.
+W_ppo <- pesos_deficiencias[def] / 100
+W_xgb <- pct_gain_def[def] / 100
+
+indice_regional <- function(W) {
+  por_imp <- lapply(disenos_imp, function(dis) {
+    D <- sapply(def, function(v) as.numeric(dis$variables[[v]] == 'Sí'))
+    dis <- update(dis, puntaje = 100 * drop(D %*% W), region = factor(glosa_region))
+    r <- survey::svyby(~puntaje, ~region, dis, survey::svymean)
+    list(est = setNames(r$puntaje, r$region), var = diag(setNames(r$se^2, r$region)))
+  })
+  comb <- mitools::MIcombine(lapply(por_imp, `[[`, 'est'), lapply(por_imp, `[[`, 'var'))
+  data.frame(Region = names(coef(comb)), Indice = coef(comb), EE = sqrt(diag(vcov(comb))), row.names = NULL)
+}
+ind_ppo <- indice_regional(W_ppo)
+ind_xgb <- indice_regional(W_xgb)
+
+# Incertidumbre de la POSICIÓN: los estratos de la EBS están anidados en las regiones,
+# por lo que los índices regionales son independientes; se simulan 5.000 rankings
+# desde N(índice, EE^2) y se informa el intervalo del 95 % de la posición.
+intervalo_posicion <- function(ind, n_sim = 5000, semilla = 20261114) {
+  set.seed(semilla)
+  sims <- replicate(n_sim, rank(-rnorm(nrow(ind), ind$Indice, ind$EE)))
+  data.frame(Region = ind$Region, Pos = rank(-ind$Indice, ties.method = 'min'),
+             Pos_LI = apply(sims, 1, quantile, 0.025), Pos_LS = apply(sims, 1, quantile, 0.975))
+}
+pos_ppo <- intervalo_posicion(ind_ppo)
+pos_xgb <- intervalo_posicion(ind_xgb)
+
+# Prevalencias regionales de cada deficiencia (%; promedio de las 5 imputaciones)
+prevalencias_reg <- Reduce(`+`, lapply(disenos_imp, function(dis) {
+  v <- dis$variables
+  sapply(def, function(k) tapply(v$fexp * (v[[k]] == 'Sí'), v$glosa_region, sum) / tapply(v$fexp, v$glosa_region, sum))
+})) / length(disenos_imp) * 100
+
+sat_alta_reg <- with(b[!is.na(b$y), ], tapply(fexp * (as.integer(y) >= 4), glosa_region, sum) / tapply(fexp, glosa_region, sum)) * 100
+info_reg <- unique(b[c('glosa_region', 'codigo_region', 'macrozona')])
+
+tabla_doble_ranking <- data.frame(
+  Region = ind_ppo$Region,
+  Codigo = info_reg$codigo_region[match(ind_ppo$Region, info_reg$glosa_region)],
+  Macrozona = as.character(info_reg$macrozona[match(ind_ppo$Region, info_reg$glosa_region)]),
+  prevalencias_reg[ind_ppo$Region, ],
+  Indice_PPO = ind_ppo$Indice, EE_PPO = ind_ppo$EE,
+  Pos_PPO = pos_ppo$Pos, Pos_PPO_LI = pos_ppo$Pos_LI, Pos_PPO_LS = pos_ppo$Pos_LS,
+  Indice_XGB = ind_xgb$Indice[match(ind_ppo$Region, ind_xgb$Region)],
+  Pos_XGB = pos_xgb$Pos[match(ind_ppo$Region, pos_xgb$Region)],
+  Sat_Alta = as.numeric(sat_alta_reg[ind_ppo$Region]),
+  row.names = NULL, check.names = FALSE
+)
+tabla_doble_ranking$Dif_Pos <- tabla_doble_ranking$Pos_XGB - tabla_doble_ranking$Pos_PPO
+tabla_doble_ranking <- tabla_doble_ranking[order(tabla_doble_ranking$Pos_PPO), ]
+rho_ranking <- cor(tabla_doble_ranking$Pos_PPO, tabla_doble_ranking$Pos_XGB, method = 'spearman')
+maule_rk <- tabla_doble_ranking[tabla_doble_ranking$Region == 'Maule', ]
+
+# ------------------------------------------------------------------------------
+# Cartografía: un mapa por macrozona (Norte, Centro, Sur), con escala de color común
+# ------------------------------------------------------------------------------
+nombre_corto <- c('15' = 'Arica y Parinacota', '01' = 'Tarapacá', '02' = 'Antofagasta', '03' = 'Atacama',
+                  '04' = 'Coquimbo', '05' = 'Valparaíso', '13' = 'Metropolitana', '06' = "O'Higgins",
+                  '07' = 'Maule', '16' = 'Ñuble', '08' = 'Biobío', '09' = 'La Araucanía', '14' = 'Los Ríos',
+                  '10' = 'Los Lagos', '11' = 'Aysén', '12' = 'Magallanes')
+tabla_doble_ranking$Nombre_Corto <- unname(nombre_corto[tabla_doble_ranking$Codigo])
+
+mapa_doble <- dplyr::left_join(mapa_continental[, c('codigo_region', 'geometry')], tabla_doble_ranking,
+                               by = c('codigo_region' = 'Codigo'))
+mapa_doble$etiqueta <- sprintf('%s\nPPO #%d · XGB #%d', mapa_doble$Nombre_Corto, mapa_doble$Pos_PPO, mapa_doble$Pos_XGB)
+limites_color <- range(tabla_doble_ranking$Indice_PPO)
+
+mapa_macrozona <- function(zona, titulo) {
+  m <- mapa_doble[mapa_doble$Macrozona == zona & !is.na(mapa_doble$Macrozona), ]
+  # Punto interior de cada región para anclar la etiqueta (cálculo planar en grados:
+  # suficiente para ubicar un texto)
+  anclas <- suppressWarnings(suppressMessages({
+    sf::sf_use_s2(FALSE); p <- sf::st_point_on_surface(m); sf::sf_use_s2(TRUE); p
+  }))
+  coords <- cbind(sf::st_drop_geometry(anclas), sf::st_coordinates(anclas))
+  ggplot(m) +
+    geom_sf(aes(fill = Indice_PPO), color = 'grey25', linewidth = 0.3) +
+    ggrepel::geom_label_repel(data = coords, aes(X, Y, label = etiqueta), size = 2.9, lineheight = 0.9,
+                              label.size = 0.15, fill = alpha('white', 0.9), min.segment.length = 0,
+                              segment.color = 'grey30', nudge_x = 2.2, direction = 'y', seed = 1) +
+    scale_fill_gradient(low = '#fee8c8', high = '#b30000', limits = limites_color,
+                        name = 'Índice de\ndéficit PPO') +
+    coord_sf(xlim = c(sf::st_bbox(m)[['xmin']], sf::st_bbox(m)[['xmax']] + 4.5), expand = TRUE) +
+    theme_void(base_size = 11) +
+    labs(title = titulo,
+         subtitle = 'Color: índice de déficit ponderado (Shapley-PPO)\nEtiqueta: posición nacional en ambos rankings (1 = mayor déficit)',
+         caption = 'Fuente: elaboración propia con microdatos EBS 2023\n(5 imputaciones) y cartografía chilemapas.') +
+    theme(plot.title = element_text(face = 'bold', size = 13), legend.position = 'left',
+          plot.subtitle = element_text(size = 9), plot.caption = element_text(size = 8))
+}
+```
+
+## 10. Exportación de Tablas y Mapas
+
+```{r paso11-exportacion}
+# ==============================================================================
+# ETAPA 11: EXPORTACIÓN DE RESULTADOS (salidas/tablas/*.csv y mapas PNG)
+# ==============================================================================
+guardar <- function(tabla, nombre) {
+  write.csv(tabla, file.path('salidas', 'tablas', paste0(nombre, '.csv')), row.names = FALSE, fileEncoding = 'UTF-8')
+}
+
+# Datos faltantes e imputación
+guardar(tabla_faltantes, 'tab_diagnostico_faltantes')
+guardar(tabla_metodos_mice, 'tab_metodos_mice')
+guardar(data.frame(Deficiencia = unname(nombre_var[def]),
+                   Beta_Casos_Completos = unname(beta[paste0(def, 'Sí')]),
+                   SE_Casos_Completos = unname(se_diseno[paste0(def, 'Sí')]),
+                   Beta_MICE = unname(coef(rubin_pool)[paste0(def, 'Sí')]),
+                   SE_MICE = unname(sqrt(diag(vcov(rubin_pool)))[paste0(def, 'Sí')])),
+        'tab_sensibilidad_mice')
+
+# Modelo restringido, supuestos y PPO
+guardar(tabla_or, 'tab_modelo_base_svyolr')
+guardar(res_paralelismo, 'tab_contraste_paralelismo')
+guardar(estabilidad_paralelismo, 'tab_contraste_paralelismo_train')
+guardar(tabla_seleccion_ppo, 'tab_seleccion_ppo')
+guardar(tabla_ppo, 'tab_ppo_coeficientes')
+guardar(tabla_ppo[grepl('^vv1_aSí', tabla_ppo$Termino), ], 'tab_ppo_humedad')
+guardar(tabla_ajuste_ppo, 'tab_ajuste_restringido_vs_ppo')
+guardar(validez_ppo, 'tab_validez_ppo')
+
+# Efectos marginales y pesos de las deficiencias (PPO y XGBoost)
+guardar(ame_ppo, 'tab_ame_ppo')
+guardar(merge(tabla_pesos_ppo, data.frame(Codigo = def, Peso_XGB_Pct = as.numeric(pct_gain_def[def])), by = 'Codigo'),
+        'tab_pesos_deficiencias')
+
+# Partición, evaluación predictiva y XGBoost
+guardar(resumen_particion, 'tab_resumen_particion')
+guardar(tabla_comparacion_test, 'tab_evaluacion_multimodelo')
+guardar(head(cv_resumen_xgb, 20), 'tab_cv_xgboost')
+guardar(tabla_importancia_xgb, 'tab_importancia_xgboost')
+
+# Territorio: doble ranking, prevalencias, macrozonas y Maule
+guardar(tabla_doble_ranking, 'tab_doble_ranking_regiones')
+guardar(data.frame(Region = rownames(prevalencias_reg), prevalencias_reg, check.names = FALSE), 'tab_prevalencias_16regiones')
+guardar(data.frame(Deficiencia = unname(nombre_var[def]),
+                   Prevalencia_Nacional_Pct = sapply(def, function(k) mean(sapply(disenos_imp, function(dis) {
+                     v <- dis$variables; 100 * sum(v$fexp * (v[[k]] == 'Sí')) / sum(v$fexp) })))),
+        'tab_prevalencias_fallas')
+guardar(tabla_macrozona, 'tab_satisfaccion_macrozonas')
+guardar(tabla_comparacion_maule, 'tab_contraste_territorial')
+
+# Mapas por macrozona en alta resolución (misma escala de color en los tres)
+for (z in c('Norte', 'Centro', 'Sur')) {
+  titulo_z <- c(Norte = 'Zona Norte (Arica y Parinacota a Coquimbo)',
+                Centro = 'Zona Centro (Valparaíso a Biobío, incluye RM y Maule)',
+                Sur = 'Zona Sur y Austral (La Araucanía a Magallanes)')[[z]]
+  ggsave(paste0('mapa_', tolower(z), '.png'), mapa_macrozona(paste('Zona', z), titulo_z),
+         width = 7, height = 8, dpi = 300, bg = 'white')
+}
+```
+
+---
+
+# PARTE II: INFORME EJECUTIVO Y FUNDAMENTACIÓN TEÓRICA {.tabset}
+
+## 1. Introducción y Contexto de Consultoría
+
+El presente informe constituye un estudio econométrico y de consultoría estadística desarrollado para la **Constructora e Inmobiliaria Independencia**. La empresa, con una presencia histórica en la zona centro-sur de Chile (especialmente en la Región del Maule), busca fundamentar con rigor técnico qué atributos y deficiencias constructivas determinan en mayor medida el bienestar subjetivo y la satisfacción residencial de las familias.
+
+Tradicionalmente, las decisiones en el sector inmobiliario han dependido de encuestas de satisfacción de postventa acotadas o de tabulaciones bivariadas simples de encuestas públicas. No obstante, las brechas observadas sin ajuste pueden confundir el efecto genuino de una falla estructural (como filtraciones o aislamiento térmico) con características sociodemográficas del hogar (edad, quintil de ingreso, régimen de tenencia) o con externalidades del entorno barrial (inseguridad, delincuencia, áreas verdes). 
+
+Para superar estas limitaciones se utiliza la **Encuesta de Bienestar Social (EBS 2023)**, elaborada por el Ministerio de Desarrollo Social y Familia (MDSF) y el Instituto Nacional de Estadísticas (INE). La base tiene un diseño muestral complejo (estratificado y por conglomerados) que representa a la población adulta del país. El estudio tiene cinco objetivos:
+
+1. **Explicar** la satisfacción con la vivienda mediante un modelo ordinal que respete el diseño muestral. Se parte del logit ordenado, se contrastan sus supuestos y se llega al modelo final de **odds parcialmente proporcionales (PPO)**.
+2. **Tratar los datos faltantes** mediante imputación múltiple (MICE).
+3. **Cuantificar el peso** de seis deficiencias constructivas: efectos marginales en puntos porcentuales y descomposición de Shapley.
+4. **Verificar la capacidad predictiva** del PPO frente a un algoritmo de aprendizaje automático (**XGBoost**) en una muestra de prueba independiente.
+5. **Construir un doble ranking regional** del déficit habitacional, con mapas por macrozona y un diagnóstico específico de la **Región del Maule**.
+
+---
+
+## 2. Fundamentos del Diseño Muestral Complejo de la EBS 2023
+
+```{r datos-diseno, include=FALSE}
+n_estratos <- length(unique(b$estrato_ebs))
+n_upm <- length(unique(b$.conglomerado))
+dis_deff <- update(diseno_completo, alta = as.numeric(as.integer(y) >= 4), humedad = as.numeric(vv1_a == 'Sí'))
+est_deff <- survey::svymean(~alta + humedad, dis_deff, deff = TRUE)
+deff_vals <- survey::deff(est_deff)
+```
+
+La EBS 2023 no es una muestra aleatoria simple. Su diseño tiene tres componentes que deben incorporarse en toda estimación (Lohr, 2000, cap. 7; Gutiérrez, 2016; INE, 2020):
+
+* **Estratificación:** El marco se divide en `r n_estratos` estratos (cruce de región y área urbana/rural) y se selecciona muestra de forma independiente en cada uno. Esto asegura la presencia de todas las regiones y reduce la varianza.
+* **Conglomeración:** Dentro de cada estrato no se seleccionan personas, sino **unidades primarias de muestreo (UPM)**, que son conglomerados de viviendas cercanas. La muestra analítica contiene `r format(n_upm, big.mark = '.', decimal.mark = ',')` UPM. Las personas de un mismo conglomerado comparten barrio, clima y tipo de construcción, por lo que se parecen entre sí más que dos personas tomadas al azar. Cada entrevista aporta entonces **menos información independiente** que en una muestra aleatoria simple.
+* **Factores de expansión (`fexp`):** Como las probabilidades de selección difieren entre estratos y hay ajustes por no respuesta, cada persona representa a un número distinto de habitantes. Las estimaciones deben ponderarse por `fexp` para ser representativas de la población; sin ellos, las regiones sobrerrepresentadas en la muestra pesarían de más.
+
+**Efecto de diseño.** El efecto de diseño ($\text{deff}$; Lohr, 2000, sec. 7.5) compara la varianza real de un estimador con la que tendría bajo muestreo aleatorio simple del mismo tamaño:
+
+$$\text{deff} = \frac{\operatorname{Var}_{\text{diseño}}(\hat\theta)}{\operatorname{Var}_{\text{MAS}}(\hat\theta)}$$
+
+En esta base, el deff de la proporción de satisfacción alta es `r fx(deff_vals[['alta']], 2)` y el de la prevalencia de humedad es `r fx(deff_vals[['humedad']], 2)`. Es decir, sus errores estándar reales son `r fx(sqrt(deff_vals[['alta']]), 2)` y `r fx(sqrt(deff_vals[['humedad']]), 2)` veces los de una muestra aleatoria simple. **Ignorar el diseño subestimaría los errores estándar:** los intervalos serían demasiado estrechos y algunos efectos parecerían significativos sin serlo.
+
+**Linealización de Taylor.** Los estimadores de este estudio (proporciones, coeficientes de regresión, efectos marginales) son funciones no lineales de totales poblacionales. Su varianza se estima aproximando cada estimador por una función lineal mediante su **función de influencia**, y calculando después la varianza de ese total con las fórmulas de un diseño estratificado por conglomerados: la variabilidad **entre UPM dentro de cada estrato** (Lohr, 2000, sec. 9.1; Lumley, 2010). Es el método estándar del INE para encuestas de hogares (INE, 2020). Dos consecuencias prácticas:
+
+* Las pruebas usan **`r format(gl_diseno, big.mark = '.', decimal.mark = ',')` grados de libertad de diseño** (número de UPM menos número de estratos), no el número de personas.
+* Los estratos con una sola UPM se tratan con el ajuste conservador de `survey` (`lonely.psu = 'adjust'`), que centra su aporte en la media general.
+
+Los modelos explicativos (logit ordenado y PPO), las prevalencias y los índices regionales se estiman con `survey` y `svyVGAM`, que aplican estas tres componentes y la linealización de Taylor. XGBoost, que no produce errores estándar, incorpora el diseño de dos formas: pondera por `fexp` y se valida con particiones por conglomerados (sección 11).
+
+---
+
+## 3. Fundamentos del Modelo Logit Ordenado y Formulación Matemática
+
+### Naturaleza de la Variable Respuesta
+La variable de estudio es `a9`: *«Pensando en su vivienda actual, ¿qué tan satisfecho está usted con ella?»*, medida en una escala Likert de 5 categorías estrictamente ordenadas:
+1. Totalmente insatisfecho
+2. Insatisfecho
+3. Indiferente
+4. Satisfecho
+5. Totalmente satisfecho
+
+El orden cualitativo contiene información ordinal inequívoca ($1 < 2 < 3 < 4 < 5$), pero las distancias entre categorías no son numéricamente homogéneas. Asumir linealidad ordinaria (MCO) impondría distancias constantes arbitrarias, mientras que dicotomizar la respuesta (satisfecho vs. no satisfecho) descartaría valiosa variabilidad en los extremos.
+
+### Representación por Variable Latente y Función de Enlace
+Siguiendo a **McCullagh (1980)**, **Agresti (2013)** y Christensen (2025), el modelo supone la existencia de una variable continua latente e inobservable de satisfacción $Y_i^* \in \mathbb{R}$, generada por:
+$$Y_i^* = \mathbf{x}_i^{\top} \boldsymbol\beta + \varepsilon_i$$
+donde $\mathbf{x}_i$ es el vector de covariables de la vivienda, el individuo y el entorno; $\boldsymbol\beta$ es el vector de coeficientes de regresión; y $\varepsilon_i$ es un término de perturbación aleatoria con distribución logística estándar ($\mu = 0, \sigma^2 = \pi^2/3$).
+
+La conexión entre la satisfacción latente $Y_i^*$ y la respuesta categórica observada $Y_i \in \{1, 2, 3, 4, 5\}$ se define a través de $J - 1 = 4$ umbrales estrictamente ordenados ($-\infty = \theta_0 < \theta_1 < \theta_2 < \theta_3 < \theta_4 < \theta_5 = +\infty$):
+$$Y_i = j \quad \Longleftrightarrow \quad \theta_{j-1} < Y_i^* \le \theta_j$$
+
+### Modelo de Logits Acumulados y Razones de Odds (Odds Ratios)
+El modelo acumulado evalúa la probabilidad de que la satisfacción de un individuo quede *hasta* la categoría $j$:
+$$P(Y_i \le j \mid \mathbf{x}_i) = F(\theta_j - \mathbf{x}_i^{\top} \boldsymbol\beta) = \frac{1}{1 + \exp\left(-(\theta_j - \mathbf{x}_i^{\top} \boldsymbol\beta)\right)}, \quad j = 1, 2, 3, 4$$
+
+Invirtiendo el cociente para modelar las probabilidades de **superar** el umbral $j$ (asociado a mayor satisfacción):
+$$\log\left[\frac{P(Y_i > j \mid \mathbf{x}_i)}{P(Y_i \le j \mid \mathbf{x}_i)}\right] = -\theta_j + \mathbf{x}_i^{\top} \boldsymbol\beta$$
+
+Bajo esta convención de signos:
+* Un coeficiente $\beta_k > 0$ implica que la presencia de la característica aumenta la propensión latente de satisfacción, incrementando los odds de situarse en categorías superiores.
+* La **Razón de Odds (OR)** para un predictor binario $X_k \in \{0, 1\}$ viene dada por:
+  $$\mathrm{OR}_k = \exp(\beta_k) = \frac{\mathrm{Odds}(Y > j \mid X_k = 1)}{\mathrm{Odds}(Y > j \mid X_k = 0)}$$
+* Si $\mathrm{OR}_k < 1$, la condición perjudica los odds de satisfacción en todos los cortes acumulados.
+
+---
+
+## 4. Tratamiento e Imputación de Datos Faltantes (MICE)
+
+### Diagnóstico del Mecanismo de Pérdida
+En la EBS 2023, la muestra total cuenta con $N = 11.234$ adultos. Al evaluar conjuntamente las variables del modelo, se identifican 299 casos con información incompleta en al menos un predictor o en la respuesta ($2{,}66\%$ del total), dejando $n = 10.935$ casos completos.
+
+```{r tabla-faltantes-resumen, echo=FALSE}
+knitr::kable(
+  head(tabla_faltantes, 8),
+  caption = "Variables con mayor frecuencia de datos faltantes en EBS 2023",
+  col.names = c("Variable", "Casos Faltantes (NA)", "Porcentaje (%)"),
+  align = c("l", "c", "c")
+)
+```
+
+La variable con mayor pérdida es la percepción de seguridad nocturna (`h2_c`, 171 NA), seguida de nivel educativo (`educacion`, 54 NA). Descartar sistemáticamente observaciones (Listwise Deletion) asume implícitamente que los datos son **Faltantes Completamente al Azar (MCAR)**. Como demuestra **Enders (2010, pp. 6-12)**, si la propensión a no responder se correlaciona con la edad, el ingreso o la zona geográfica, el análisis de casos completos puede introducir sesgo de selección en los estimadores y subestimar la varianza muestral.
+
+### Metodología MICE y Reglas de Rubin
+Para robustecer la inferencia se implementó **Imputación Múltiple por Ecuaciones Encadenadas (MICE)** bajo el supuesto de **Faltantes al Azar (MAR)** (Enders, 2010, cap. 8). Bajo MAR, la probabilidad de que falte un dato puede depender de características observadas (edad, región, ingreso), por lo que cada variable incompleta se imputa con un modelo **condicional** a todas las demás, elegido según su escala de medición:
+
+```{r tabla-metodos-mice, echo=FALSE}
+etiqueta_metodo <- c(logreg = 'Regresión logística (binaria)',
+                     polr = 'Logit acumulado (ordinal)',
+                     polyreg = 'Logit multinomial (nominal)')
+tm <- tabla_metodos_mice[order(-tabla_metodos_mice$Casos_NA), ]
+tm$Metodo <- paste0(etiqueta_metodo[tm$Metodo], ' — `', tm$Metodo, '`')
+knitr::kable(
+  tm, row.names = FALSE,
+  caption = "Modelo de imputación asignado a cada variable incompleta",
+  col.names = c("Variable", "Casos faltantes", "Método MICE"), align = c("l", "c", "l")
+)
+```
+
+Como variables auxiliares se incluyeron la **región** y el **logaritmo del factor de expansión**, que están completos y no se imputan. Así, el modelo de imputación refleja la estructura del diseño muestral que después usa el análisis ponderado (Lumley, 2010). La satisfacción $Y$ también se imputa y actúa como predictora de las demás variables, lo que preserva su asociación con las deficiencias. Se generaron $m = `r imp_mice$m`$ bases con `r imp_mice$iteration` iteraciones cada una.
+
+**Convergencia.** El siguiente gráfico muestra la media y la desviación estándar de los valores imputados en cada iteración, una línea por cadena, para las variables con más faltantes. Si las cadenas se entremezclan sin tendencia, el algoritmo convergió (van Buuren, 2018, sec. 6.5).
+
+```{r grafico-convergencia-mice, echo=FALSE, fig.height=6.5, fig.width=9}
+vars_conv <- head(tm_codigos <- names(sort(colSums(is.na(datos_imp_in))[metodos_mice != ''], decreasing = TRUE)), 4)
+conv <- do.call(rbind, lapply(vars_conv, function(v) {
+  rbind(
+    data.frame(Variable = v, Estadistico = 'Media', Iteracion = seq_len(imp_mice$iteration),
+               stack(as.data.frame(imp_mice$chainMean[v, , ]))),
+    data.frame(Variable = v, Estadistico = 'Desv. estándar', Iteracion = seq_len(imp_mice$iteration),
+               stack(as.data.frame(sqrt(imp_mice$chainVar[v, , ]))))
+  )
+}))
+conv$Variable <- factor(unname(c(y = 'Satisfacción (Y)', nombre_var)[conv$Variable]),
+                        levels = unname(c(y = 'Satisfacción (Y)', nombre_var)[vars_conv]))
+conv$Estadistico <- factor(conv$Estadistico, levels = c('Media', 'Desv. estándar'))
+conv$ind <- sub('Chain', 'Cadena', conv$ind)
+ggplot(conv, aes(Iteracion, values, color = ind, group = ind)) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(Estadistico ~ Variable, scales = 'free_y', ncol = 4) +
+  scale_x_continuous(breaks = seq_len(imp_mice$iteration)) +
+  theme_minimal(base_size = 10) +
+  labs(title = 'Diagnóstico de convergencia de MICE',
+       subtitle = 'Media y desviación estándar del código numérico de los valores imputados, por cadena',
+       x = 'Iteración', y = NULL, color = 'Cadena') +
+  theme(legend.position = 'bottom', plot.title = element_text(face = 'bold'))
+```
+
+En cada base imputada, el modelo se reestimó incorporando el diseño complejo y los parámetros se combinaron mediante las **Reglas de Rubin**:
+
+$$\bar{\boldsymbol\beta} = \frac{1}{m} \sum_{\ell=1}^m \widehat{\boldsymbol\beta}^{(\ell)}, \qquad \mathbf{V}_{\text{total}} = \mathbf{W} + \left(1 + \frac{1}{m}\right) \mathbf{B}$$
+donde $\mathbf{W}$ es la varianza intra-imputación promedio y $\mathbf{B}$ es la varianza entre imputaciones.
+
+```{r comparacion-mice-completo, echo=FALSE}
+comp_df <- data.frame(
+  Deficiencia = nombre_var[def],
+  Beta_Casos_Completos = round(beta[paste0(def, 'Sí')], 3),
+  SE_Casos_Completos = round(se_diseno[paste0(def, 'Sí')], 3),
+  Beta_MICE = round(res_rubin[paste0(def, 'Sí'), 'results'], 3),
+  SE_MICE = round(res_rubin[paste0(def, 'Sí'), 'se'], 3)
+)
+knitr::kable(
+  comp_df,
+  caption = "Sensibilidad de Coeficientes: Casos Completos (n = 10.935) vs. MICE (N = 11.234)",
+  col.names = c("Deficiencia", "Beta (Casos Comp.)", "SE (Casos Comp.)", "Beta (MICE)", "SE (MICE)"),
+  align = c("l", "c", "c", "c", "c")
+)
+```
+
+```{r resumen-sensibilidad-mice, include=FALSE}
+dif_beta_mice <- abs(comp_df$Beta_MICE - comp_df$Beta_Casos_Completos)
+rel_beta_mice <- dif_beta_mice / comp_df$SE_Casos_Completos
+fmi_def <- rubin_pool$missinfo[paste0(def, 'Sí')]
+```
+
+**Conclusión metodológica:** La mayor diferencia entre los coeficientes de casos completos y los de MICE en las seis deficiencias es de `r format(round(max(dif_beta_mice), 3), decimal.mark = ',')`, en `r tolower(comp_df$Deficiencia[which.max(dif_beta_mice)])`. Equivale a `r format(round(max(rel_beta_mice), 2), decimal.mark = ',')` errores estándar, muy por debajo de la incertidumbre muestral del propio coeficiente. La fracción de información perdida por los faltantes es a lo sumo `r format(round(100 * max(fmi_def), 1), decimal.mark = ',')` %. Con `r format(sum(!b$completo), big.mark = '.', decimal.mark = ',')` casos incompletos (`r format(round(100 * mean(!b$completo), 2), decimal.mark = ',')` %), ambas estrategias llevan a las mismas conclusiones sustantivas. Se adopta la base imputada (N = `r format(nrow(b), big.mark = '.', decimal.mark = ',')`) como base analítica del modelo final, porque no descarta información y es válida bajo MAR, un supuesto menos exigente que el MCAR que requiere el análisis de casos completos.
+
+---
+
+## 5. Comprobación Rigurosa de Supuestos Estadísticos
+
+### Supuesto de Odds Proporcionales (Regresión Paralela)
+El supuesto cardinal del logit ordenado estándar es que el efecto de cada covariable es idéntico a través de los $J - 1 = 4$ umbrales acumulados ($\boldsymbol\beta_1 = \boldsymbol\beta_2 = \boldsymbol\beta_3 = \boldsymbol\beta_4 = \boldsymbol\beta$). 
+
+Para evaluarlo en presencia de ponderaciones complejas, se ejecutó un **test de Wald con diseño** basado en el apilamiento de funciones de influencia de 4 regresiones logísticas binarias independientes:
+$$H_0: \boldsymbol\beta_2 - \boldsymbol\beta_1 = \mathbf{0}, \quad \boldsymbol\beta_3 - \boldsymbol\beta_1 = \mathbf{0}, \quad \boldsymbol\beta_4 - \boldsymbol\beta_1 = \mathbf{0}$$
+
+```{r tabla-paralelismo-mostrar, echo=FALSE}
+knitr::kable(
+  res_paralelismo[, c('Variable', 'F_stat', 'gl1', 'gl2', 'p', 'p_Holm', 'Clasificacion')],
+  caption = "Contraste de Paralelismo (Odds Proporcionales) con Diseño Muestral: global y por variable",
+  col.names = c("Variable", "Estadístico F", "gl Contraste", "gl Diseño", "p-valor", "p-valor (Holm)", "Clasificación (α = 0,05)"),
+  digits = c(0, 3, 0, 0, 4, 4, 0),
+  align = c("l", "c", "c", "c", "c", "c", "l"),
+  row.names = FALSE
+)
+```
+
+* **Diagnóstico global:** La prueba conjunta rechaza el supuesto de odds proporcionales ($F = `r gsub(',', '{,}', format(round(res_paralelismo$F_stat[1], 3), decimal.mark = ','), fixed = TRUE)`$, $gl_1 = `r res_paralelismo$gl1[1]`$, $gl_2 = `r res_paralelismo$gl2[1]`$, $p < 0{,}0001$).
+* **Diagnóstico por variable:** El rechazo global **no** se reparte entre todos los predictores. Con la regla de Williams (2006) —Wald por variable a $\alpha = 0{,}05$, sin corrección por multiplicidad— solo `r sum(res_paralelismo$Clasificacion == 'No paralelo (candidato)')` de los `r length(pred)` predictores son candidatos a no paralelos: `r paste(res_paralelismo$Variable[res_paralelismo$Clasificacion == 'No paralelo (candidato)'], collapse = ', ')`. Entre las deficiencias físicas, **solo la humedad** viola el supuesto; el frío lo cumple holgadamente ($p = `r gsub(',', '{,}', format(round(res_paralelismo$p[res_paralelismo$Codigo %in% 'vv2'], 3), decimal.mark = ','), fixed = TRUE)`$).
+* **Sensibilidad a la multiplicidad:** Con la corrección de Holm ninguna variable alcanza significancia individual (el menor $p$ ajustado es `r format(round(min(res_paralelismo$p_Holm, na.rm = TRUE), 3), decimal.mark = ',')`). El rechazo global refleja desviaciones pequeñas y acumuladas en `r res_paralelismo$gl1[1]` restricciones más que una violación masiva; por eso se libera solo lo necesario (PPO) y no todo el modelo (GOLOGIT).
+
+### Nivel 2: Estabilidad del rechazo en la partición de entrenamiento
+
+Para verificar que el rechazo del paralelismo es **estructural** y no un artefacto de una muestra particular, el mismo test se repitió solo con el **80 % de entrenamiento** (sección 11.3), es decir, con un `r fx(resumen_particion$Pct_Personas[1], 0)` % de las personas y un número menor de conglomerados.
+
+```{r tabla-estabilidad-paralelismo, echo=FALSE}
+knitr::kable(
+  estabilidad_paralelismo,
+  caption = "Estabilidad del test de odds proporcionales: muestra completa vs. partición de entrenamiento",
+  col.names = c("Variable", "p-valor (completa)", "p-valor (entrenamiento)", "Decisión (completa)",
+                "Decisión (entrenamiento)", "¿Coincide?"),
+  digits = c(0, 4, 4, 0, 0, 0), align = c("l", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+cand_train <- pred[paralelismo_train$p[-1] < alpha_ppo]
+```
+
+* **Global:** En el entrenamiento el test conjunto `r if (paralelismo_train$p[1] < alpha_ppo) 'vuelve a rechazar' else 'no rechaza'` el supuesto ($F = `r gsub(',', '{,}', fx(paralelismo_train$F_stat[1]))`$, $p `r fp(paralelismo_train$p[1])`$). `r if (paralelismo_train$p[1] < alpha_ppo) 'El rechazo es, por lo tanto, estructural.' else 'El rechazo global depende del tamaño muestral y debe interpretarse con cautela.'`
+* **Por variable:** La decisión coincide en `r sum(estabilidad_paralelismo$Coincide[-1])` de los `r length(pred)` predictores. En el entrenamiento son candidatos a no paralelos: `r if (length(cand_train)) paste(nombre_var[cand_train], collapse = ', ') else 'ninguno'`. `r if ('vv1_a' %in% cand_train) 'La humedad vuelve a violar el supuesto, lo que confirma que su efecto cambia a lo largo de la escala.' else 'La humedad no alcanza significancia individual en el entrenamiento; con un 20 % menos de datos, su no paralelismo es menos nítido.'` Los $p$-valores individuales cercanos a 0,05 son sensibles al tamaño muestral, lo que es esperable con un efecto de magnitud moderada.
+
+### Diagnóstico de Multicolinealidad (GVIF)
+Se evaluó el Factor de Inflación de la Varianza Generalizado (GVIF) sobre la matriz de covarianzas ponderada para evitar redundancias entre predictores.
+
+```{r tabla-gvif-mostrar, echo=FALSE}
+knitr::kable(
+  head(tabla_gvif[order(-tabla_gvif$GVIF_ajustado), ], 8),
+  caption = "Diagnóstico de Colinealidad: Factores con mayor GVIF ajustado",
+  col.names = c("Variable", "gl", "GVIF", "GVIF^(1/(2*gl))"),
+  digits = c(0, 0, 3, 3),
+  align = c("l", "c", "c", "c")
+)
+```
+
+* **Diagnóstico:** El valor máximo de $\text{GVIF}^{1/(2 \cdot gl)}$ es $`r gsub(',', '{,}', fx(max(tabla_gvif$GVIF_ajustado), 3))`$, correspondiente a `r tolower(tabla_gvif$Variable[which.max(tabla_gvif$GVIF_ajustado)])`. Está muy por debajo del umbral de alerta de $2{,}0$, equivalente a un VIF clásico de 4 (O'Brien, 2007). No hay riesgo de inestabilidad por multicolinealidad.
+
+---
+
+## 6. Qué Ruta Seguir si No se Cumplen los Supuestos
+
+El rechazo empírico del supuesto de odds proporcionales plantea una disyuntiva metodológica fundamental. En la literatura econométrica especializada (**Williams, 2006, 2016**; Agresti, 2013), se definen con claridad las rutas a seguir:
+
+```
+                            [Evaluación de Odds Proporcionales]
+                                             |
+                         -----------------------------------------
+                        |                                         |
+                  [Se Cumple]                               [Se Rechaza]
+                        |                                         |
+            [Logit Ordenado Estándar]               -----------------------------
+                  (MASS::polr / svyolr)            |                             |
+                                             [RUTA RECOMENDADA]          [RUTAS DESACONSEJADAS]
+                                                   |                             |
+                                      ---------------------------      ----------------------
+                                     |                           |    |                      |
+                              [Modelo PPO]                 [GOLOGIT] [MCO Lineal]    [Multinomial]
+                        (Odds Parcialmente Prop.)      (Totalmente Libre) (Falso continuo) (Ignora orden)
+```
+
+### 1. Modelo de Odds Proporcionales Parciales (PPO) – Ruta Recomendada
+Propuesto formalmente por **Williams (2006, 2016)**, el modelo PPO restringe a pendientes comunes solo aquellas variables que cumplen el paralelismo, mientras libera coeficientes específicos por corte ($\boldsymbol\beta_j$) únicamente para las variables que fallan el supuesto:
+$$\log\left[\frac{P(Y_i > j \mid \mathbf{x}_i)}{P(Y_i \le j \mid \mathbf{x}_i)}\right] = -\theta_j + \mathbf{x}_{1i}^{\top} \boldsymbol\beta + \mathbf{x}_{2i}^{\top} \boldsymbol\gamma_j$$
+
+* **Ventaja:** Preserva la naturaleza ordinal de la respuesta, ahorra grados de libertad respecto del GOLOGIT y corrige la violación del paralelismo solo donde ocurre.
+* **Precaución:** A diferencia del modelo restringido, el PPO **puede** predecir probabilidades negativas, porque al liberar $\boldsymbol\gamma_j$ los umbrales acumulados pueden cruzarse para algunos perfiles (Williams, 2006). Por eso su validez debe verificarse explícitamente (sección 7.6).
+
+### 2. Modelo Logit Ordenado Generalizado (GOLOGIT)
+Permite que la totalidad de los predictores varíen en cada uno de los cortes. Equivale conceptualmente a estimar una serie de modelos logísticos binarios acumulados simultáneos, corrigiendo la matriz de covarianza conjunta. Requiere verificar que las probabilidades acumuladas predichas no se crucen ($\theta_j - \mathbf{x}^{\top}\boldsymbol\beta_j < \theta_{j+1} - \mathbf{x}^{\top}\boldsymbol\beta_{j+1}$).
+
+### 3. Rutas Desaconsejadas en Consultoría Estadística
+* **Regresión Lineal MCO:** Imponer códigos $1, 2, 3, 4, 5$ asumiendo normalidad y homocedasticidad produce predicciones fuera de rango y distorsiona la significancia en variables asimétricas.
+* **Logit Multinomial Nominal:** Tratar la satisfacción como clases no ordenadas descarta la estructura monotónica latente, multiplicando por 4 el número de parámetros sin necesidad teórica y perdiendo sustancial potencia estadística.
+
+**Conclusión:** como el supuesto de odds proporcionales se rechaza (sección 5), el modelo restringido no es una especificación válida para el conjunto de los predictores. El modelo final de este estudio es el **PPO** (sección 7); el modelo restringido se conserva solo como referencia de comparación (sección 8).
+
+---
+
+## 7. Modelo Final: Odds Parcialmente Proporcionales (PPO)
+
+```{r ppo-formato, include=FALSE}
+or_hum <- tabla_ppo[grepl('^vv1_aSí:', tabla_ppo$Termino), ]
+or_sexo <- tabla_ppo[grepl('^sg01', tabla_ppo$Termino), ]
+nombres_no_par <- unname(nombre_var[vars_no_paralelas])
+fila_ajuste <- tabla_ajuste_ppo
+```
+
+### 7.1 Ruta elegida
+
+Ante el rechazo del paralelismo se optó por el **modelo de odds parcialmente proporcionales (PPO)**, propuesto por Peterson y Harrell (1990) y desarrollado por Williams (2006, 2016): conserva un único coeficiente para los predictores que cumplen el supuesto y libera coeficientes por umbral solo para los que lo violan. Se descartaron el GOLOGIT completo, que liberaría los `r length(pred)` predictores y multiplicaría por cuatro los parámetros sin respaldo empírico (sección 5); la regresión lineal (MCO), que ignora la escala ordinal; y el logit multinomial, que pierde el orden de las categorías.
+
+### 7.2 Formulación y especificación
+
+El modelo estimado es
+
+$$\log\left[\frac{P(Y_i > j \mid \mathbf{x}_i, \mathbf{z}_i)}{P(Y_i \le j \mid \mathbf{x}_i, \mathbf{z}_i)}\right] = -\theta_j + \mathbf{x}_i^{\top}\boldsymbol\beta + \mathbf{z}_i^{\top}\boldsymbol\gamma_j, \qquad j = 1, 2, 3, 4$$
+
+donde $\mathbf{x}_i$ reúne los predictores **paralelos** (un único $\boldsymbol\beta$, un único OR) y $\mathbf{z}_i$ los **no paralelos** (un $\boldsymbol\gamma_j$ por umbral, cuatro OR). Se mantiene la convención de la sección 3: un coeficiente positivo aumenta los odds de ubicarse **por encima** del umbral $j$, es decir, de estar más satisfecho.
+
+**Selección de los predictores no paralelos.** Los candidatos de la sección 5 se liberaron uno a uno, en orden creciente de $p$-valor. Cada predictor se mantuvo libre solo si (i) el PPO convergía con todas las probabilidades predichas dentro de $(0, 1)$ y (ii) el test de Wald de diseño de sus $\boldsymbol\gamma_j$, calculado **dentro del PPO**, seguía siendo significativo al 5 %.
+
+```{r tabla-seleccion-ppo, echo=FALSE}
+knitr::kable(
+  tabla_seleccion_ppo,
+  caption = "Selección hacia adelante de los predictores no paralelos (casos completos, diseño complejo)",
+  col.names = c("Variable", "p-valor (sección 5)", "Prob. mínima predicha", "Ajuste válido",
+                "F (Wald en el PPO)", "p-valor (Wald en el PPO)", "Decisión"),
+  digits = c(0, 4, 4, 0, 3, 4, 0), align = c("l", "c", "c", "c", "c", "c", "l"), row.names = FALSE
+)
+```
+
+La especificación final libera **`r length(vars_no_paralelas)` predictores**: `r paste(nombres_no_par, collapse = ', ')`. El **tramo etario** fue candidato, pero liberarlo produce probabilidades negativas (umbrales que se cruzan), concentradas en el grupo de 80 años o más, cuyas celdas intermedias son muy pequeñas. Por eso se mantiene paralelo, como recomienda Williams (2006). El resto de los predictores, incluidas `r sum(!def %in% vars_no_paralelas)` de las seis deficiencias físicas, tiene un efecto común a los cuatro umbrales.
+
+El modelo se estimó con `svyVGAM::svy_vglm` y la familia `VGAM::cumulative(parallel = FALSE ~ z, reverse = TRUE)`, que incorpora estratos, conglomerados y factores de expansión mediante linealización de Taylor (Yee, 2015; Lumley, 2010). Se ajustó en cada una de las $m = 5$ bases imputadas y los resultados se combinaron con las Reglas de Rubin (sección 4).
+
+### 7.3 Coeficientes estimados y Odds Ratios
+
+#### Ecuación estimada del PPO
+
+El modelo final se escribe en dos partes. La primera es una **parte común** $\widehat{\eta}^{\,\text{común}}_i$, con los `r length(vars_paralelas)` predictores paralelos, cada uno con un coeficiente que vale igual en los cuatro umbrales. La segunda es una **parte específica de cada umbral**: el intercepto $\widehat{\alpha}_j = -\widehat{\theta}_j$ y los `r length(vars_no_paralelas)` predictores no paralelos, con un coeficiente distinto en cada corte. Cada término es una variable indicadora respecto de la categoría de referencia, y los coeficientes son la combinación de Rubin de las 5 imputaciones:
+
+```{r ecuacion-ppo, echo=FALSE, results='asis'}
+# Etiqueta legible de un coeficiente: «Variable (categoría)» o solo «Variable» si es binaria Sí
+etiqueta_coef <- function(t) {
+  v <- pred[vapply(pred, function(p) startsWith(t, p), logical(1))]
+  v <- v[which.max(nchar(v))]
+  cat_t <- sub('^[0-9]+\\. ', '', substring(t, nchar(v) + 1))
+  base <- if (v == 'territorio') 'Región' else nombre_var[[v]]
+  etiqueta <- if (cat_t %in% c('Sí', '1. Sí')) base else paste0(base, ' (', cat_t, ')')
+  gsub('([%&#_])', '\\\\\\1', etiqueta)
+}
+num_tex <- function(x) gsub(',', '{,}', fx(abs(x), 3), fixed = TRUE)
+termino_tex <- function(valor, etiqueta) {
+  sprintf('%s %s \\cdot \\text{%s}_i', ifelse(valor < 0, '-', '+'), num_tex(valor), etiqueta)
+}
+lineas_tex <- function(terminos, por_linea = 2) {
+  terminos[1] <- sub('^\\+ ', '', terminos[1])
+  filas <- split(terminos, ceiling(seq_along(terminos) / por_linea))
+  paste(vapply(filas, paste, character(1), collapse = ' '), collapse = ' \\\\\n& ')
+}
+
+# Parte común: coeficientes sin sufijo ':j'
+comunes <- names(coef_ppo)[!grepl(':[1-4]$', names(coef_ppo))]
+cat('**Parte común (predictores paralelos):**\n\n$$\\begin{aligned}\n\\widehat{\\eta}^{\\,\\text{común}}_i =\\;& ',
+    lineas_tex(vapply(comunes, function(t) termino_tex(coef_ppo[[t]], etiqueta_coef(t)), character(1))),
+    '\n\\end{aligned}$$\n\n', sep = '')
+
+# Parte específica de cada umbral: intercepto + predictores no paralelos
+nombres_umbral <- c('1' = 'supera «Totalmente insatisfecho»', '2' = 'supera «Insatisfecho»',
+                    '3' = 'supera «Indiferente» (satisfacción alta)', '4' = 'supera «Satisfecho»')
+cat('**Parte específica de cada umbral (intercepto y predictores no paralelos):**\n\n')
+for (j in 1:4) {
+  especificos <- grep(paste0(':', j, '$'), names(coef_ppo), value = TRUE)
+  especificos <- setdiff(especificos, paste0('(Intercept):', j))
+  terminos <- vapply(especificos, function(t) termino_tex(coef_ppo[[t]], etiqueta_coef(sub(':[1-4]$', '', t))),
+                     character(1))
+  cat(sprintf('*Umbral $j = %d$ (%s):*\n\n', j, nombres_umbral[[as.character(j)]]))
+  cat(sprintf('$$\\begin{aligned}\n\\text{logit}\\,\\widehat{P}(Y_i > %d) =\\;& %s%s + \\widehat{\\eta}^{\\,\\text{común}}_i \\\\\n& %s\n\\end{aligned}$$\n\n',
+              j, ifelse(coef_ppo[[paste0('(Intercept):', j)]] < 0, '-', ''),
+              num_tex(coef_ppo[[paste0('(Intercept):', j)]]), lineas_tex(terminos)))
+}
+```
+
+Con estas ecuaciones, la probabilidad de cada categoría para cualquier perfil se obtiene por diferencia de probabilidades acumuladas:
+
+$$\widehat{P}(Y_i = k) = \widehat{P}(Y_i > k-1) - \widehat{P}(Y_i > k), \qquad \widehat{P}(Y_i > 0) = 1,\ \widehat{P}(Y_i > 5) = 0,$$
+
+donde $\widehat{P}(Y_i > j) = 1 / \left[1 + \exp\left(-\text{logit}\,\widehat{P}(Y_i > j)\right)\right]$. En particular, la probabilidad de satisfacción alta es $\widehat{P}(Y_i \ge 4) = \widehat{P}(Y_i > 3)$, que solo depende del umbral $j = 3$. Por eso los efectos marginales de la sección 7.7 sobre la satisfacción alta usan los coeficientes de la humedad en ese umbral.
+
+#### Tabla de coeficientes de las deficiencias
+
+La siguiente tabla presenta las seis deficiencias físicas. Para las paralelas se informa un único OR y para la humedad un OR por umbral.
+
+```{r tabla-ppo-deficiencias, echo=FALSE}
+tab_def_ppo <- tabla_ppo[grepl(paste0('^(', paste(def, collapse = '|'), ')Sí'), tabla_ppo$Termino),
+                         c('Variable', 'Umbral', 'Beta', 'SE', 'OR', 'LI_95', 'LS_95', 'p_valor')]
+tab_def_ppo$Umbral <- ifelse(tab_def_ppo$Umbral == 'Común', 'Común (paralelo)',
+                             paste0('j = ', tab_def_ppo$Umbral, ' (Y > ', tab_def_ppo$Umbral, ')'))
+knitr::kable(
+  tab_def_ppo,
+  caption = "PPO: coeficientes de las seis deficiencias habitacionales (combinación de Rubin, m = 5)",
+  col.names = c("Deficiencia", "Umbral", "Beta", "EE (diseño)", "OR", "IC 95% Inf.", "IC 95% Sup.", "p-valor"),
+  digits = c(0, 0, 3, 3, 3, 3, 3, 4), align = c("l", "l", "c", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+```
+
+<details>
+<summary><b>Tabla completa del PPO (todos los predictores y umbrales)</b></summary>
+
+```{r tabla-ppo-completa, echo=FALSE}
+knitr::kable(
+  tabla_ppo[, c('Variable', 'Categoria', 'Umbral', 'Beta', 'SE', 'OR', 'LI_95', 'LS_95', 'p_valor')],
+  caption = "PPO: estimación completa con errores estándar de diseño (combinación de Rubin, m = 5)",
+  col.names = c("Variable", "Categoría", "Umbral", "Beta", "EE (diseño)", "OR", "IC 95% Inf.", "IC 95% Sup.", "p-valor"),
+  digits = c(0, 0, 0, 3, 3, 3, 3, 3, 4), align = c("l", "l", "c", "c", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+```
+
+</details>
+
+### 7.4 Interpretación por umbral de los predictores no paralelos
+
+Cada umbral $j$ compara a quienes están **por encima** de la categoría $j$ con quienes están en ella o por debajo: $j = 1$ separa a los totalmente insatisfechos del resto; $j = 2$, a los insatisfechos (1–2) de los demás; $j = 3$, a los satisfechos (4–5) de los no satisfechos (1–3); y $j = 4$, a los totalmente satisfechos del resto.
+
+```{r tabla-ppo-no-paralelos, echo=FALSE}
+tab_np <- tabla_ppo[tabla_ppo$Umbral != 'Común' & tabla_ppo$Variable != 'Umbral (intercepto)',
+                    c('Variable', 'Categoria', 'Umbral', 'OR', 'LI_95', 'LS_95', 'p_valor')]
+knitr::kable(
+  tab_np,
+  caption = "PPO: Odds Ratios por umbral de los predictores no paralelos",
+  col.names = c("Variable", "Categoría", "Umbral j", "OR", "IC 95% Inf.", "IC 95% Sup.", "p-valor"),
+  digits = c(0, 0, 0, 3, 3, 3, 4), align = c("l", "l", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+knitr::kable(
+  tabla_wald_ppo,
+  caption = "Wald de diseño dentro del PPO combinado: H0 = igualdad de los coeficientes en los cuatro umbrales",
+  col.names = c("Variable", "Estadístico F", "gl Contraste", "gl Diseño", "p-valor"),
+  digits = c(0, 3, 0, 0, 4), align = c("l", "c", "c", "c", "c"), row.names = FALSE
+)
+```
+
+* **Humedad o goteras (`vv1_a`):** Es la única deficiencia física no paralela. Su efecto es negativo y significativo en los cuatro umbrales (OR entre `r fx(min(or_hum$OR))` y `r fx(max(or_hum$OR))`), pero su intensidad cambia: es máximo en el umbral $j = `r which.min(or_hum$OR)`$ (OR $= `r gsub(',', '{,}', fx(min(or_hum$OR)))`$) y menor en los extremos de la escala ($j = 1$: OR $= `r gsub(',', '{,}', fx(or_hum$OR[1]))`$; $j = 4$: OR $= `r gsub(',', '{,}', fx(or_hum$OR[4]))`$). En términos prácticos, la humedad pesa sobre todo en el paso de la insatisfacción o indiferencia a la satisfacción, que es justamente el margen que mueve la percepción de calidad en postventa. El modelo restringido promediaba estos efectos en un único OR de `r fx(exp(beta['vv1_aSí']))`.
+* **Frío y las otras deficiencias:** Son paralelas, así que su OR es único y se interpreta igual en todos los umbrales. El frío reduce los odds de mayor satisfacción a `r fx(tabla_ppo$OR[tabla_ppo$Termino == 'vv2Sí'])` veces y la falta de ventilación a `r fx(tabla_ppo$OR[tabla_ppo$Termino == 'vv1_cSí'])` veces. El calor sigue sin ser significativo ($p `r fp(tabla_ppo$p_valor[tabla_ppo$Termino == 'vv3Sí'])`$).
+* **Sexo, medio ambiente comunal y rayados en el barrio:** Son controles cuyo efecto cambia a lo largo de la escala. En el sexo y en los rayados ningún coeficiente por umbral es significativo por sí solo. Lo que el Wald detecta es un **cambio de dirección** entre umbrales: por ejemplo, para las mujeres el OR es `r fx(or_sexo$OR[1])` en $j = 1$ y `r fx(or_sexo$OR[3])` en $j = 3$. Para el medio ambiente comunal, una evaluación buena o regular protege sobre todo contra la insatisfacción total ($j = 1$), mientras que una evaluación excelente se asocia principalmente con estar totalmente satisfecho ($j = 4$, OR $= `r gsub(',', '{,}', fx(tabla_ppo$OR[tabla_ppo$Termino == 'g25. Excelente:4']))`$).
+
+### 7.5 Comparación de ajuste: Restringido vs. PPO
+
+```{r tabla-ajuste-ppo, echo=FALSE}
+knitr::kable(
+  tabla_ajuste_ppo,
+  caption = "Comparación de ajuste (deviance y AIC ponderados; promedio de las 5 imputaciones)",
+  col.names = c("Modelo", "Parámetros", "Deviance ponderada", "AIC ponderado"),
+  digits = c(0, 0, 1, 1), align = c("l", "c", "c", "c"), row.names = FALSE
+)
+```
+
+* **Contraste formal (Wald de diseño conjunto):** Las `r wald_conjunto_ppo[['gl1']]` restricciones que el PPO libera son, en conjunto, distintas de cero ($F = `r gsub(',', '{,}', fx(wald_conjunto_ppo[['F_stat']]))`$, $gl_1 = `r wald_conjunto_ppo[['gl1']]`$, $gl_2 = `r wald_conjunto_ppo[['gl2']]`$, $p `r fp(wald_conjunto_ppo[['p']])`$). Imponer el paralelismo a estos predictores empeora el modelo de forma significativa.
+* **Criterio descriptivo:** El PPO reduce la deviance ponderada en `r fx(diff(rev(tabla_ajuste_ppo$Deviance)), 1)` unidades con `r diff(tabla_ajuste_ppo$Parametros)` parámetros adicionales, y su AIC ponderado es `r fx(diff(rev(tabla_ajuste_ppo$AIC)), 1)` unidades menor. Con diseño complejo no existe una verosimilitud verdadera, por lo que el AIC se informa solo como referencia; la decisión se basa en el Wald de diseño.
+
+### 7.6 Validez del PPO: probabilidades predichas en [0, 1]
+
+```{r tabla-validez-ppo, echo=FALSE}
+knitr::kable(
+  validez_ppo,
+  caption = "Verificación de probabilidades predichas del PPO combinado sobre toda la muestra imputada",
+  col.names = c("Imputación", "N", "Prob. mínima", "Prob. máxima", "Casos con P fuera de [0, 1]", "Máx. |ΣP − 1|"),
+  digits = c(0, 0, 4, 4, 0, 10), align = c("c", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+```
+
+Con los coeficientes combinados, las `r format(validez_ppo$N[1], big.mark = '.', decimal.mark = ',')` personas de cada base imputada tienen las cinco probabilidades predichas dentro de $(0, 1)$: `r sum(validez_ppo$Casos_fuera_rango)` casos fuera de rango. Además, cada vector de probabilidades suma 1. **El PPO es válido para toda la muestra** y puede usarse para efectos marginales, ponderaciones y predicción.
+
+### 7.7 Efectos Marginales Promedio (AME) de las seis deficiencias
+
+Los OR expresan efectos sobre los *odds*, que la gerencia no interpreta directamente. Siguiendo a Manríquez García (2023), se tradujeron a **puntos porcentuales (pp)** de probabilidad mediante el **Efecto Marginal Promedio**:
+
+$$\mathrm{AME}_k = \sum_{i} w_i \left[\widehat{P}(Y_i \ge 4 \mid \mathbf{x}_i, D_{ik} = 1) - \widehat{P}(Y_i \ge 4 \mid \mathbf{x}_i, D_{ik} = 0)\right], \qquad w_i = \frac{\text{fexp}_i}{\sum_h \text{fexp}_h}$$
+
+Es decir, se compara la probabilidad de satisfacción alta de **toda la población** en dos escenarios: con la deficiencia $k$ y sin ella, manteniendo cada persona con sus demás características observadas. Como el PPO distingue los umbrales, se informa también el efecto sobre la **insatisfacción** $P(Y \le 2)$. Los intervalos se obtienen por el método delta con la varianza de diseño, combinando las cinco imputaciones con las Reglas de Rubin.
+
+```{r tabla-ame-ppo, echo=FALSE}
+tab_ame <- ame_ppo[order(ame_ppo$AME_alta_pp), ]
+tab_ame$IC_alta <- sprintf('[%s; %s]', fx(tab_ame$LI_alta, 1), fx(tab_ame$LS_alta, 1))
+tab_ame$IC_baja <- sprintf('[%s; %s]', fx(tab_ame$LI_baja, 1), fx(tab_ame$LS_baja, 1))
+knitr::kable(
+  tab_ame[, c('Deficiencia', 'Prob_Sin', 'Prob_Con', 'AME_alta_pp', 'IC_alta', 'AME_baja_pp', 'IC_baja')],
+  caption = "PPO: Efectos Marginales Promedio de cada deficiencia (pp), con IC 95% de diseño (Rubin, m = 5)",
+  col.names = c("Deficiencia", "P(Y ≥ 4) sin la falla (%)", "P(Y ≥ 4) con la falla (%)",
+                "AME sobre P(Y ≥ 4) (pp)", "IC 95%", "AME sobre P(Y ≤ 2) (pp)", "IC 95%"),
+  digits = c(0, 1, 1, 1, 0, 1, 0), align = c("l", "c", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+a_hum <- ame_ppo[ame_ppo$Codigo == 'vv1_a', ]
+a_frio <- ame_ppo[ame_ppo$Codigo == 'vv2', ]
+a_vent <- ame_ppo[ame_ppo$Codigo == 'vv1_c', ]
+a_calor <- ame_ppo[ame_ppo$Codigo == 'vv3', ]
+```
+
+* **Humedad o goteras:** Si toda la población viviera con humedad, la proporción satisfecha bajaría de `r fx(a_hum$Prob_Sin, 1)` % a `r fx(a_hum$Prob_Con, 1)` %, es decir, **`r fx(a_hum$AME_alta_pp, 1)` pp**. La insatisfacción subiría **`r fx(a_hum$AME_baja_pp, 1)` pp**. Es el mayor efecto de las seis fallas. Supera al del modelo restringido (`r fx(efectos_discretos_def$Cambio_pp[efectos_discretos_def$Deficiencia == nombre_var[['vv1_a']]], 1)` pp), porque el PPO capta que la humedad pesa más en los umbrales intermedios, que son los que definen P(Y ≥ 4).
+* **Frío y ventilación:** Son el segundo bloque, con `r fx(a_frio$AME_alta_pp, 1)` pp y `r fx(a_vent$AME_alta_pp, 1)` pp sobre la satisfacción alta.
+* **Calor:** Su efecto (`r fx(a_calor$AME_alta_pp, 1)` pp) tiene un intervalo que incluye el cero: `r if (a_calor$LI_alta < 0 & a_calor$LS_alta > 0) 'no es distinguible de un efecto nulo' else 'es distinto de cero'`.
+
+---
+
+## 8. Modelo de Referencia: Logit Ordenado Restringido
+
+> **Nota:** esta sección presenta el modelo con odds proporcionales para todos los predictores. Como el supuesto se rechaza (sección 5), sus resultados se conservan **solo como referencia** frente al modelo final PPO (sección 7).
+
+### Ecuación Matemática Numérica Estimada
+La especificación completa del modelo estimado (casos completos, $n = `r format(nrow(d_analitica), big.mark = '.', decimal.mark = ',')`$) se expresa a través de su **predictor lineal latente** $\widehat{\eta}_i$, con todos sus coeficientes, y sus cuatro umbrales de corte. Cada término es una variable indicadora (1 si la persona pertenece a esa categoría, 0 si no), con respecto a la categoría de referencia de cada predictor:
+
+```{r ecuacion-restringido, echo=FALSE, results='asis'}
+# Etiqueta legible de cada coeficiente: «Variable (categoría)» o solo «Variable» si es binaria Sí/No
+etiqueta_coef <- function(t) {
+  v <- pred[vapply(pred, function(p) startsWith(t, p), logical(1))]
+  v <- v[which.max(nchar(v))]
+  cat_t <- sub('^[0-9]+\\. ', '', substring(t, nchar(v) + 1))
+  base <- if (v == 'territorio') 'Región' else nombre_var[[v]]
+  etiqueta <- if (cat_t %in% c('Sí', '1. Sí')) base else paste0(base, ' (', cat_t, ')')
+  gsub('([%&#_])', '\\\\\\1', etiqueta)
+}
+num_tex <- function(x) gsub(',', '{,}', fx(abs(x), 3), fixed = TRUE)
+terminos <- vapply(names(beta), function(t) {
+  sprintf('%s %s \\cdot \\text{%s}_i', ifelse(beta[[t]] < 0, '-', '+'), num_tex(beta[[t]]), etiqueta_coef(t))
+}, character(1))
+terminos[1] <- sub('^\\+ ', '', terminos[1])
+filas <- split(terminos, ceiling(seq_along(terminos) / 2))
+cat('$$\\begin{aligned}\n\\widehat{\\eta}_i =\\;& ',
+    paste(vapply(filas, paste, character(1), collapse = ' '), collapse = ' \\\\\n& '),
+    '\n\\end{aligned}$$\n\n', sep = '')
+cat('Los cuatro **umbrales de corte estimados** ($\\widehat{\\theta}_j$) son:\n\n$$',
+    paste(sprintf('\\widehat{\\theta}_%d = %s%s', 1:4, ifelse(modelo_logit$zeta < 0, '-', ''),
+                  num_tex(modelo_logit$zeta)), collapse = ', \\quad '), '$$\n', sep = '')
+```
+
+Para cualquier perfil de vivienda y hogar, la probabilidad predicha de alcanzar una satisfacción alta ($Y \ge 4$, es decir, estar satisfecho o totalmente satisfecho) se calcula directamente mediante la función logística:
+$$\widehat{P}(Y_i \ge 4 \mid \mathbf{x}_i) = 1 - \frac{1}{1 + \exp\left(-(\widehat{\theta}_3 - \widehat{\eta}_i)\right)} = \frac{1}{1 + \exp\left(\widehat{\theta}_3 - \widehat{\eta}_i\right)}$$
+
+### Interpretación de Razones de Odds (Odds Ratios) de las Deficiencias
+La siguiente tabla presenta las Razones de Odds (OR) ajustadas para las seis deficiencias habitacionales críticas, controlando por el estado socioeconómico, edad, tenencia y externalidades de barrio.
+
+```{r tabla-or-deficiencias, echo=FALSE}
+tab_or_def <- tabla_or[match(paste0(def, 'Sí'), tabla_or$Termino), ]
+tab_or_def$Termino <- unname(nombre_var[def])
+tab_or_def <- tab_or_def[order(tab_or_def$OR), ]
+knitr::kable(
+  tab_or_def[, c('Termino', 'Beta', 'SE', 'OR', 'LI_95', 'LS_95', 'p_valor')],
+  caption = "Modelo restringido: Razones de Odds (OR) e IC 95% de diseño para las deficiencias habitacionales",
+  col.names = c("Deficiencia", "Coeficiente Beta", "Error Estándar", "Odds Ratio (OR)", "IC 95% Inferior", "IC 95% Superior", "p-valor"),
+  digits = c(0, 3, 3, 3, 3, 3, 4),
+  align = c("l", "c", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+```
+
+```{r texto-or-restringido, echo=FALSE, results='asis'}
+for (i in seq_len(nrow(tab_or_def))) {
+  f <- tab_or_def[i, ]
+  sig <- f$p_valor < 0.05
+  cat(sprintf(
+    '%d. **%s:** $\\mathrm{OR} = %s$ (IC 95%%: [%s; %s], $p %s$). %s\n',
+    i, f$Termino, gsub(',', '{,}', fx(f$OR, 3)), fx(f$LI_95, 3), fx(f$LS_95, 3), fp(f$p_valor),
+    if (sig) sprintf('Presentar esta falla %s los odds de una mayor satisfacción en un %s %%, a igualdad de las demás variables.',
+                     ifelse(f$OR < 1, 'reduce', 'aumenta'), fx(100 * abs(1 - f$OR), 1))
+    else 'Su efecto no es estadísticamente distinguible de cero al 5 %.'
+  ))
+}
+```
+
+### Efectos Marginales Discretos Estandarizados (Puntos Porcentuales)
+Complementando los OR y siguiendo a **Manríquez García (2023)**, se computaron los cambios en puntos porcentuales (pp) sobre la probabilidad de satisfacción alta ($P(Y \ge 4)$).
+
+```{r tabla-efectos-marginales, echo=FALSE}
+knitr::kable(
+  efectos_discretos_def,
+  caption = "Impacto Discreto Estandarizado de cada Deficiencia sobre la Satisfacción Alta P(Y >= 4)",
+  col.names = c("Deficiencia", "Prob. Sin Problema (%)", "Prob. Con Problema (%)", "Impacto Neto (pp)", "IC 95% Inferior", "IC 95% Superior"),
+  digits = c(0, 1, 1, 1, 1, 1),
+  align = c("l", "c", "c", "c", "c", "c")
+)
+```
+
+En el modelo restringido, tener humedad reduce la probabilidad de estar satisfecho en `r fx(efectos_discretos_def$Cambio_pp[1], 1)` pp. Estos valores son solo de referencia: los efectos del modelo final están en la sección 7.7.
+
+---
+
+## 9. Puntuación Regional, Ranking de las 16 Regiones y Mapas
+
+### Construcción del Índice de Déficit Habitacional
+#### Pesos de las seis deficiencias: dominancia general / Shapley sobre el PPO
+
+Los OR y los AME miden cuánto cambia la satisfacción con cada falla, pero no cuánto **explica** cada una del ajuste total, que es lo que se necesita para ponderar un índice. Para eso se usó el **análisis de dominancia general** de Luchman (2014), equivalente al valor de Shapley:
+
+1. Se ajustaron los $2^6 = 64$ submodelos PPO posibles, uno por cada combinación de deficiencias, con los 18 controles siempre presentes y la misma especificación de no paralelismo del modelo final. Se hizo en cada una de las 5 bases imputadas: **`r nrow(ll_submodelos)` ajustes**.
+2. En cada submodelo se calculó el $R^2$ de McFadden ponderado, $R^2 = 1 - \ell(\text{submodelo}) / \ell(\text{nulo})$.
+3. El aporte de la deficiencia $k$ es el aumento medio de $R^2$ al agregarla a los submodelos que no la contienen. Primero se promedia dentro de cada tamaño de submodelo y luego entre tamaños. Así ninguna falla queda favorecida por el orden en que se incorpora.
+
+Las seis deficiencias aportan en conjunto `r fx(100 * sum(aportes_dominancia), 2)` puntos de $R^2$ (de `r fx(100 * r2_controles, 2)` % con solo los controles a `r fx(100 * r2_completo, 2)` % con el modelo completo). El peso $W_k$ es la fracción de ese aporte que corresponde a cada falla:
+
+```{r tabla-pesos-ppo, echo=FALSE}
+knitr::kable(
+  data.frame(tabla_pesos_ppo$Ranking, tabla_pesos_ppo$Deficiencia, 100 * tabla_pesos_ppo$Aporte_R2,
+             tabla_pesos_ppo$Peso_Pct,
+             sprintf('%s – %s', fx(tabla_pesos_ppo$Peso_Min, 1), fx(tabla_pesos_ppo$Peso_Max, 1)),
+             tabla_pesos_ppo$AME_alta_pp),
+  caption = "Pesos de Shapley/dominancia general de las seis deficiencias (PPO, promedio de 5 imputaciones)",
+  col.names = c("Posición", "Deficiencia", "Aporte a R² (puntos × 100)", "Peso W_k (%)",
+                "Rango entre imputaciones (%)", "AME sobre P(Y ≥ 4) (pp)"),
+  digits = c(0, 0, 3, 1, 0, 1), align = c("c", "l", "c", "c", "c", "c"), row.names = FALSE
+)
+p_top2 <- sum(head(tabla_pesos_ppo$Peso_Pct, 2))
+```
+
+Las dos primeras fallas, `r tolower(tabla_pesos_ppo$Deficiencia[1])` y `r tolower(tabla_pesos_ppo$Deficiencia[2])`, concentran el **`r fx(p_top2, 1)` %** de la importancia explicativa de las deficiencias físicas. El rango entre imputaciones es estrecho, por lo que los pesos no dependen de cómo se imputaron los faltantes.
+
+#### Doble índice de déficit habitacional y ranking de las 16 regiones
+
+Con los pesos de cada modelo y las prevalencias regionales de cada deficiencia ($\widehat{\pi}_{rk}$, ponderadas por diseño y promediadas sobre las 5 imputaciones), se calcularon dos índices:
+
+$$\widehat{I}^{\,\text{PPO}}_r = 100 \sum_{k=1}^{6} W^{\text{Shapley}}_k\, \widehat{\pi}_{rk}, \qquad \widehat{I}^{\,\text{XGB}}_r = 100 \sum_{k=1}^{6} W^{\text{Gain}}_k\, \widehat{\pi}_{rk}, \qquad \sum_k W_k = 1$$
+
+Cada índice se interpreta como el **porcentaje "equivalente" de la población afectado por las fallas, ponderadas por su gravedad**. Un valor más alto indica mayor concentración de las fallas que más deterioran la satisfacción. El índice de cada región es la media ponderada de un puntaje individual, por lo que su error estándar se estimó con el diseño complejo. A partir de él se simularon 5.000 rankings para obtener un **intervalo del 95 % para la posición** de cada región.
+
+```{r tabla-pesos-dobles, echo=FALSE}
+knitr::kable(
+  data.frame(Deficiencia = unname(nombre_var[def]), PPO = 100 * W_ppo, XGB = 100 * W_xgb)[order(-W_ppo), ],
+  caption = "Pesos de las deficiencias en cada índice (%)",
+  col.names = c("Deficiencia", "Peso PPO (Shapley)", "Peso XGBoost (Gain)"),
+  digits = c(0, 1, 1), align = c("l", "c", "c"), row.names = FALSE
+)
+```
+
+```{r tabla-doble-ranking, echo=FALSE}
+tdr <- tabla_doble_ranking
+tdr$Pos_IC <- sprintf('%d [%d–%d]', tdr$Pos_PPO, round(tdr$Pos_PPO_LI), round(tdr$Pos_PPO_LS))
+tdr$Indice_PPO_txt <- sprintf('%s ± %s', fx(tdr$Indice_PPO, 1), fx(1.96 * tdr$EE_PPO, 1))
+knitr::kable(
+  tdr[, c('Nombre_Corto', 'Macrozona', def, 'Indice_PPO_txt', 'Pos_IC', 'Indice_XGB', 'Pos_XGB', 'Dif_Pos', 'Sat_Alta')],
+  caption = "Doble ranking regional del déficit habitacional (EBS 2023): prevalencias (%), índices y posiciones",
+  col.names = c("Región", "Macrozona", "Humedad", "Luz", "Ventil.", "Ruido", "Frío", "Calor",
+                "Índice PPO (± IC 95%)", "Posición PPO [IC 95%]", "Índice XGBoost", "Posición XGBoost",
+                "Δ posición (XGB − PPO)", "Satisfacción alta (%)"),
+  digits = c(0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1), align = c("l", "l", rep("c", 12)), row.names = FALSE
+)
+top3 <- head(tabla_doble_ranking$Nombre_Corto, 3)
+max_dif <- tabla_doble_ranking[which.max(abs(tabla_doble_ranking$Dif_Pos)), ]
+```
+
+* **Estabilidad entre modelos:** La correlación de Spearman entre ambos rankings es $\rho = `r gsub(',', '{,}', fx(rho_ranking, 2))`$. El orden general es muy similar, pero las posiciones exactas sí cambian: `r sum(abs(tabla_doble_ranking$Dif_Pos) <= 1)` de las 16 regiones se mueven a lo sumo un lugar, y la mayor diferencia es la de `r max_dif$Nombre_Corto` (`r max_dif$Pos_PPO`.º en PPO y `r max_dif$Pos_XGB`.º en XGBoost). El parecido general se debe a que ambos modelos dan los mayores pesos a humedad y frío. Las diferencias de posición se concentran en regiones con índices muy cercanos, donde el mayor peso que XGBoost da a ruido y calor basta para invertir el orden.
+* **Mayor déficit:** Las regiones con mayor índice PPO son `r paste(top3, collapse = ', ')`.
+* **Incertidumbre:** Los intervalos de posición son amplios en el tramo medio de la tabla. Varias regiones contiguas tienen índices estadísticamente indistinguibles, por lo que el ranking debe leerse por **grupos** de regiones, no lugar por lugar.
+
+**Diagnóstico de la Región del Maule.** El Maule ocupa el lugar **`r maule_rk$Pos_PPO` en el ranking PPO** (IC 95% de la posición: `r round(maule_rk$Pos_PPO_LI)`–`r round(maule_rk$Pos_PPO_LS)`) y el **`r maule_rk$Pos_XGB` en el ranking XGBoost**, con un índice de `r fx(maule_rk$Indice_PPO, 1)`. Su prevalencia de humedad es `r fx(maule_rk$vv1_a, 1)` % y la de frío `r fx(maule_rk$vv2, 1)` %. Al mismo tiempo, su satisfacción alta observada es `r fx(maule_rk$Sat_Alta, 1)` %, una de las más altas del país. Una satisfacción declarada alta convive con una exposición relevante a las fallas más graves, y esa es justamente la brecha que una constructora puede cerrar en obra.
+
+### Visualización cartográfica: un mapa por macrozona
+
+Los tres mapas usan **la misma escala de color** (índice PPO), así que los tonos son comparables entre zonas. Cada región se etiqueta con su posición nacional en ambos rankings.
+
+```{r mapa-zona-norte, echo=FALSE, fig.height=7.5, fig.width=7}
+mapa_macrozona('Zona Norte', 'Zona Norte (Arica y Parinacota a Coquimbo)')
+```
+
+```{r mapa-zona-centro, echo=FALSE, fig.height=7.5, fig.width=7}
+mapa_macrozona('Zona Centro', 'Zona Centro (Valparaíso a Biobío, incluye RM y Maule)')
+```
+
+```{r mapa-zona-sur, echo=FALSE, fig.height=8, fig.width=7}
+mapa_macrozona('Zona Sur', 'Zona Sur y Austral (La Araucanía a Magallanes)')
+```
+
+```{r resumen-zonas-mapa, include=FALSE}
+indice_zona <- tapply(tabla_doble_ranking$Indice_PPO, tabla_doble_ranking$Macrozona, mean)
+```
+
+Promediando las regiones de cada zona, el índice PPO es `r fx(indice_zona[['Zona Norte']], 1)` en el Norte, `r fx(indice_zona[['Zona Centro']], 1)` en el Centro y `r fx(indice_zona[['Zona Sur']], 1)` en el Sur.
+
+* **Norte:** Todas sus regiones están en la mitad inferior del ranking PPO. Su menor prevalencia de frío reduce el índice, aunque su satisfacción observada es, en promedio, la más baja del país, lo que apunta a factores distintos de estas seis fallas.
+* **Centro y Sur:** Concentran el déficit. El foco crítico es un **bloque continuo desde O'Higgins hasta Los Lagos**, que incluye al Maule, Ñuble, Biobío, La Araucanía y Los Ríos. Las excepciones son los extremos de cada zona: Valparaíso y la Región Metropolitana en el Centro, y Magallanes en el Sur, todas con índices bajos.
+
+Estos patrones son descriptivos: el índice mide la prevalencia ponderada de las fallas, no sus causas.
+
+---
+
+## 10. Comparación entre Macrozonas (Norte, Centro y Sur)
+
+Para entregar lineamientos macroestratégicos a la gerencia de Constructora Independencia, las 16 regiones se agruparon en tres **macrozonas**:
+
+1. **Zona Norte** (Arica y Parinacota a Coquimbo, 5 regiones): clima árido y semiárido.
+2. **Zona Centro** (Valparaíso a Biobío, incluidas la Región Metropolitana, el Maule y Ñuble; 6 regiones): clima mediterráneo, con la mayor densidad de población y el mercado principal de Independencia.
+3. **Zona Sur y Austral** (La Araucanía a Magallanes, 5 regiones): clima lluvioso y frío.
+
+```{r tabla-macrozonas-resumen, echo=FALSE}
+knitr::kable(
+  tabla_macrozona,
+  caption = "Comparación de Satisfacción Alta P(Y >= 4) por Macrozonas (Diseño Ponderado)",
+  col.names = c("Macrozona", "Muestra (n)", "Satisfacción Alta (%)", "Error Estándar (%)", "IC 95% Inferior", "IC 95% Superior"),
+  digits = c(0, 0, 1, 2, 1, 1),
+  align = c("l", "c", "c", "c", "c", "c")
+)
+```
+
+```{r grafico-macrozonas, echo=FALSE, fig.height=4.5, fig.width=8}
+ggplot(tabla_macrozona, aes(x = Macrozona, y = Satisfaccion_Alta_Pct, fill = Macrozona)) +
+  geom_col(width = 0.55, color = 'grey20') +
+  geom_errorbar(aes(ymin = LI_95, ymax = LS_95), width = 0.18, size = 0.8) +
+  geom_text(aes(label = paste0(round(Satisfaccion_Alta_Pct, 1), '%')), vjust = -1.6, fontface = 'bold') +
+  scale_fill_manual(values = c('Zona Norte' = '#e69f00', 'Zona Centro' = '#0072b2', 'Zona Sur' = '#009e73')) +
+  scale_y_continuous(limits = c(0, 90), breaks = seq(0, 90, 15)) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Nivel de Satisfacción Residencial Alta por Macrozona de Chile",
+    subtitle = "Medias poblacionales con factores de expansión e intervalos de confianza del 95%",
+    x = "Macrozona Geográfica",
+    y = "Población con Satisfacción Alta (%)"
+  ) +
+  theme(legend.position = 'none', plot.title = element_text(face = 'bold'))
+```
+
+### Contrastes estadísticos entre zonas
+
+```{r datos-macrozona-texto, include=FALSE}
+tm_z <- setNames(split(tabla_macrozona, tabla_macrozona$Macrozona), as.character(tabla_macrozona$Macrozona))
+txt_zona <- function(z) sprintf('%s %% (IC 95%%: %s–%s %%)', fx(tm_z[[z]]$Satisfaccion_Alta_Pct, 1),
+                                 fx(tm_z[[z]]$LI_95, 1), fx(tm_z[[z]]$LS_95, 1))
+crudo_m <- tabla_comparacion_maule[1, ]; ppo_m <- tabla_comparacion_maule[3, ]
+```
+
+* **Prueba global:** El test de Wald de diseño sobre el factor macrozona da $F = `r gsub(',', '{,}', fx(as.numeric(wald_macro$Ftest), 2))`$ y $p `r fp(as.numeric(wald_macro$p))`$. `r if (as.numeric(wald_macro$p) < 0.05) 'La satisfacción alta difiere entre zonas a nivel poblacional.' else 'No hay evidencia de diferencias entre zonas.'`
+* **Magnitudes:** Satisfacción alta de `r txt_zona('Zona Norte')` en el Norte, `r txt_zona('Zona Centro')` en el Centro y `r txt_zona('Zona Sur')` en el Sur. La diferencia está en el Norte: su satisfacción es menor pese a tener el índice de déficit más bajo (sección 9). Las seis fallas constructivas no explican esa brecha, que apunta a factores no medidos aquí. Identificarlos excede los datos de este estudio.
+
+### La Región del Maule: brecha cruda y brecha ajustada
+
+```{r tabla-maule, echo=FALSE}
+knitr::kable(
+  tabla_comparacion_maule,
+  caption = "Satisfacción alta P(Y ≥ 4): Maule vs. resto del país, sin y con ajuste por covariables (%)",
+  col.names = c("Escenario", "Maule (%)", "Resto del país (%)", "Diferencia (pp)", "IC 95% inf.", "IC 95% sup."),
+  digits = c(0, 1, 1, 2, 2, 2), align = c("l", rep("c", 5)), row.names = FALSE
+)
+```
+
+* **Brecha cruda:** Sin ajustar, la satisfacción alta del Maule supera al resto del país en `r fx(crudo_m$Diferencia_pp, 1)` pp (IC 95%: `r fx(crudo_m$LI_95, 1)` a `r fx(crudo_m$LS_95, 1)`).
+* **Brecha ajustada por el PPO:** Al comparar a la **misma población** como si viviera en el Maule o en el resto del país, es decir, con iguales deficiencias, tenencia, ingreso, edad y entorno, la diferencia es `r fx(ppo_m$Diferencia_pp, 2)` pp (IC 95%: `r fx(ppo_m$LI_95, 2)` a `r fx(ppo_m$LS_95, 2)`). `r if (ppo_m$LI_95 < 0 & ppo_m$LS_95 > 0) 'No es distinguible de cero.' else 'Es estadísticamente distinta de cero.'`
+* **Lectura:** `r if (ppo_m$LI_95 < 0 & ppo_m$LS_95 > 0) 'La mayor satisfacción observada en el Maule se explica por la composición de su población y sus viviendas, no por un «efecto Maule» propio. Para la empresa, la satisfacción maulina no está garantizada por el territorio: depende de las mismas condiciones —sobre todo humedad y frío— que en el resto del país.' else 'Aun a igualdad de condiciones, el Maule muestra una satisfacción distinta del resto del país, lo que sugiere factores territoriales propios no incluidos en el modelo.'`
+
+---
+
+## 11. Modelamiento Predictivo con Machine Learning (XGBoost) y Validación Multimodelo
+
+Para robustecer las decisiones estratégicas de Constructora Independencia, el estudio implementó un **enfoque multimodelo complementario**:
+
+1. **Modelo PPO con diseño complejo (inferencia y explicación):** Aporta interpretabilidad probabilística, contrastes de hipótesis con el diseño muestral y estimaciones de *Odds Ratios* y efectos marginales. Sus resultados describen asociaciones ajustadas, no efectos causales.
+2. **Extreme Gradient Boosting - XGBoost (Capacidad Predictiva y No Linealidad):** Algoritmo de ensamble no paramétrico basado en cientos de árboles de decisión (Chen & Guestrin, 2016), capaz de capturar interacciones complejas de orden superior entre variables sociodemográficas y habitacionales sin asumir linealidad ni paralelismo funcional.
+
+### 11.1 Fundamentos teóricos de XGBoost
+
+**Árboles de decisión.** Un árbol de clasificación divide el espacio de predictores en regiones mediante preguntas binarias sucesivas, por ejemplo: «¿tiene humedad?» y luego «¿la vivienda es arrendada?». Cada región final, u **hoja**, asigna un valor de predicción. Elige en cada paso la división que más reduce el error. Un árbol solo es fácil de interpretar, pero inestable: pequeños cambios en los datos cambian su forma (Hastie et al., 2009).
+
+**Boosting por gradiente.** En vez de un árbol grande, el *boosting* suma muchos árboles pequeños, $\hat{f}(\mathbf{x}) = \sum_{t=1}^{T} f_t(\mathbf{x})$. Cada nuevo árbol $f_t$ se ajusta para corregir los errores que dejan los anteriores: aproxima el **gradiente negativo** de la función de pérdida, que en regresión equivale a los residuos. En este estudio, con 5 categorías, el modelo produce un puntaje por categoría y lo convierte en probabilidades con la función *softmax*. La pérdida es la entropía cruzada ponderada.
+
+**Función objetivo regularizada (Chen & Guestrin, 2016).** XGBoost minimiza en cada iteración $t$
+
+$$\mathcal{L}^{(t)} = \sum_{i=1}^{n} w_i\, \ell\!\left(y_i,\ \hat{y}_i^{(t-1)} + f_t(\mathbf{x}_i)\right) + \Omega(f_t), \qquad \Omega(f) = \gamma\, T_f + \tfrac{1}{2}\lambda \sum_{h=1}^{T_f} \omega_h^2$$
+
+donde $w_i$ es el peso de la persona (aquí, factor de expansión × corrección por desbalance), $T_f$ es el número de hojas del árbol y $\omega_h$ el valor de cada hoja. El término $\Omega$ **penaliza la complejidad**: $\gamma$ encarece agregar hojas y $\lambda$ encoge los valores de las hojas hacia cero. Mediante una aproximación de Taylor de segundo orden de la pérdida, el valor óptimo de cada hoja y la ganancia de cada división se calculan en forma cerrada con los gradientes $g_i$ y hessianos $h_i$:
+
+$$\text{Ganancia} = \frac{1}{2}\left[\frac{G_L^2}{H_L + \lambda} + \frac{G_R^2}{H_R + \lambda} - \frac{(G_L + G_R)^2}{H_L + H_R + \lambda}\right] - \gamma$$
+
+donde $G$ y $H$ son las sumas de $g_i$ y $h_i$ en los nodos izquierdo (L) y derecho (R).
+
+**Hiperparámetros y su rol.**
+
+| Hiperparámetro | Qué controla | Efecto de aumentarlo |
+|---|---|---|
+| `max_depth` | Profundidad máxima de cada árbol | Captura interacciones de mayor orden; más riesgo de sobreajuste |
+| `learning_rate` ($\eta$) | Fracción de cada árbol que se suma al modelo | Aprende más rápido, pero con menos estabilidad |
+| `nrounds` | Número de árboles | Más capacidad; debe equilibrarse con $\eta$ |
+| `subsample` | Fracción de personas usada en cada árbol | Valores bajos agregan aleatoriedad y reducen el sobreajuste |
+| `min_child_weight` | Suma mínima de hessianos (ponderados) en una hoja | Impide reglas basadas en muy pocas personas |
+
+**Importancia por ganancia (*Gain*).** Cada vez que un predictor se usa para dividir un nodo, la división reduce la pérdida en la cantidad «Ganancia» de la fórmula anterior. El *Gain* de un predictor es la suma de esas reducciones en todos los árboles, expresada como porcentaje del total. Con codificación *one-hot*, el *Gain* de una variable es la suma del de sus categorías. Es una medida **predictiva**: indica cuánto ayuda una variable a separar categorías dentro de los árboles, sin descontar lo que comparte con otras variables ni indicar la dirección del efecto.
+
+### 11.2 Marco de comparación: modelo explicativo vs. modelo predictivo
+
+Los dos modelos responden **preguntas distintas** (Shmueli, 2010):
+
+| | PPO (explicativo) | XGBoost (predictivo) |
+|---|---|---|
+| **Pregunta** | ¿Cuánto cambia la satisfacción con cada falla, a igualdad de lo demás? | ¿Qué tan bien se anticipa la satisfacción de personas nuevas? |
+| **Producto** | Coeficientes, OR, AME e intervalos con diseño muestral | Probabilidades predichas y su desempeño fuera de muestra |
+| **Supuestos** | Forma funcional logística acumulada; paralelismo parcial | Ninguna forma funcional; aprende interacciones de los datos |
+| **Validación** | Pruebas de hipótesis y diagnóstico de supuestos | Rendimiento en datos no usados para entrenar |
+| **Importancia** | Shapley sobre el $R^2$ (contribución explicativa neta) | *Gain* (contribución a las divisiones de los árboles) |
+
+Compararlos sirve para dos cosas. Si XGBoost, con toda su flexibilidad, **no predice mejor** que el PPO, la estructura del PPO no deja fuera interacciones o no linealidades relevantes. Y si ambos **coinciden en la jerarquía de fallas**, esa prioridad no depende del método.
+
+**Por qué la partición se hace por conglomerados y no por hogares.** Si personas del mismo conglomerado quedaran en entrenamiento y en prueba, el modelo aprendería rasgos de su vecindario (tipología constructiva, clima, barrio) y los "reconocería" en la prueba. El desempeño medido sería optimista y no reflejaría la predicción en barrios nuevos, que es lo que enfrentaría la empresa en un proyecto inmobiliario distinto.
+
+**Métricas de evaluación:**
+
+* **Exactitud:** porcentaje de aciertos exactos. Con categorías desbalanceadas es engañosa, porque predecir siempre la clase más frecuente ya acierta más de la mitad.
+* **Exactitud balanceada:** promedio de la sensibilidad de cada categoría. Da el mismo peso a cada nivel de satisfacción; el azar da 20 %.
+* **Kappa ponderado cuadrático (QWK):** acuerdo ordinal corregido por azar, que castiga cada error según el cuadrado de su distancia ($W_{ab} = (a-b)^2/16$). Vale 0 para el azar y 1 para la predicción perfecta (Cohen, 1968).
+* **AUC-ROC de insatisfacción:** probabilidad de que el modelo asigne mayor riesgo de insatisfacción ($Y \le 2$) a una persona insatisfecha que a una que no lo está. Vale 0,5 para el azar y 1 para la discriminación perfecta (Hosmer et al., 2013).
+* **Línea base:** predecir siempre la clase más frecuente. Todo modelo útil debe superarla en exactitud balanceada, QWK y AUC.
+
+### 11.3 Repartición entrenamiento/prueba sin fuga de información
+
+Un modelo no puede evaluarse con los mismos datos con que se ajustó, porque aprende también el ruido de esa muestra. Por eso se reservó una **muestra de prueba independiente**, generada desde cero en el código sobre la base completa ($N = `r format(nrow(b), big.mark = '.', decimal.mark = ',')`$):
+
+* **Partición por conglomerados:** Se reparten conglomerados (UPM) completos, no personas. Las personas de un mismo conglomerado son vecinas y se parecen; si quedaran a ambos lados, la prueba "conocería" el vecindario y su desempeño sería optimista (fuga de información vecinal).
+* **Estratificación:** Dentro de cada estrato de diseño, los conglomerados con y sin personas insatisfechas se reparten 80/20 por separado, para conservar la composición territorial y la proporción de insatisfechos.
+* **Imputación sin fuga:** El modelo MICE se ajustó **solo con el entrenamiento**; las filas de prueba se imputan con ese modelo, pero no lo alimentan. Además, la satisfacción de la prueba se ocultó durante la imputación, para que los faltantes de sus predictores no se completaran con información de su propia respuesta.
+
+```{r tabla-particion, echo=FALSE}
+knitr::kable(
+  resumen_particion,
+  caption = "Repartición entrenamiento/prueba por conglomerados (semilla fija, reproducible)",
+  col.names = c("Conjunto", "Personas", "Conglomerados", "Estratos", "% de personas", "% de la población (fexp)"),
+  digits = c(0, 0, 0, 0, 1, 1), align = c("l", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+knitr::kable(
+  data.frame(Categoria = respuestas, dist_particion, row.names = NULL),
+  caption = "Distribución ponderada de la satisfacción en cada parte (%)",
+  col.names = c("Satisfacción", "Entrenamiento (%)", "Prueba (%)"), digits = c(0, 1, 1), align = c("l", "c", "c")
+)
+```
+
+La partición se exporta en `particion_compartida_imputada.csv`, para que XGBoost se evalúe sobre exactamente las mismas personas.
+
+### 11.4 Evaluación fuera de muestra del PPO
+
+Para que la prueba no intervenga en ninguna decisión, **la especificación del PPO también se eligió solo con el entrenamiento**, con la misma regla de la sección 7.2: se libera un candidato solo si el modelo sigue siendo válido y su Wald dentro del PPO es significativo.
+
+```{r tabla-seleccion-train, echo=FALSE}
+knitr::kable(
+  tabla_seleccion_train,
+  caption = "Selección de predictores no paralelos usando solo el entrenamiento (casos completos)",
+  col.names = c("Variable", "p-valor (test de paralelismo)", "Prob. mínima predicha", "Ajuste válido",
+                "p-valor (Wald en el PPO)", "Decisión"),
+  digits = c(0, 4, 4, 0, 4, 0), align = c("l", "c", "c", "c", "c", "l"), row.names = FALSE
+)
+comunes_np <- intersect(vars_no_paralelas, vars_no_paralelas_train)
+```
+
+* **Coinciden con la muestra completa:** `r if (length(comunes_np)) paste(nombre_var[comunes_np], collapse = ', ') else 'ningún predictor'`. `r if ('vv1_a' %in% comunes_np) 'En particular, **la humedad es no paralela en ambas muestras**: es el resultado más estable del análisis.' else ''`
+* **Difieren:** solo en la muestra completa, `r if (length(setdiff(vars_no_paralelas, vars_no_paralelas_train))) paste(nombre_var[setdiff(vars_no_paralelas, vars_no_paralelas_train)], collapse = ', ') else 'ninguno'`; solo en el entrenamiento, `r if (length(setdiff(vars_no_paralelas_train, vars_no_paralelas))) paste(nombre_var[setdiff(vars_no_paralelas_train, vars_no_paralelas)], collapse = ', ') else 'ninguno'`. Estos controles tienen evidencia de no paralelismo cercana al umbral del 5 %. Algunos no pueden liberarse a la vez sin que se crucen los umbrales, así que la variable que queda libre depende del orden de evidencia en cada muestra. Que la deficiencia de interés principal sea estable y los controles marginales no lo sean es un patrón esperable, y no altera las conclusiones sobre las fallas constructivas.
+
+Con esa especificación, el PPO se reestimó en las `r imp_particion$m` imputaciones del entrenamiento y se combinó con Rubin. `r if (all(ppo_train_validos)) 'El modelo fue válido en las cinco imputaciones' else 'Hubo imputaciones con ajuste inválido'`, y sus probabilidades en la prueba quedan en [`r fx(validez_prueba_ppo[['min']], 4)`; `r fx(validez_prueba_ppo[['max']], 4)`]. Los coeficientes de las deficiencias son estables respecto de la muestra completa: la mayor diferencia es `r fx(max(abs(estabilidad_coef$Beta_Completa - estabilidad_coef$Beta_Entrenamiento)), 3)`, equivalente a `r fx(max(abs(estabilidad_coef$Beta_Completa - estabilidad_coef$Beta_Entrenamiento) / estabilidad_coef$EE_Entrenamiento), 2)` errores estándar.
+
+Sobre las `r format(length(y_te), big.mark = '.', decimal.mark = ',')` personas de prueba con satisfacción observada, se compararon dos reglas de decisión con la línea base:
+
+* **Clase más probable:** asigna a cada persona la categoría de mayor probabilidad predicha.
+* **Regla balanceada:** elige la categoría con mayor cociente $\widehat{P}_k / \pi_k$, donde $\pi_k$ es la prevalencia de la categoría en el entrenamiento. Equivale a entrenar con pesos de clase balanceados, el mismo criterio que usa XGBoost, y prioriza detectar las categorías poco frecuentes.
+* **Línea base:** predice siempre la clase más frecuente del entrenamiento («`r respuestas[clase_modal]`»).
+
+```{r tabla-metricas-ppo, echo=FALSE}
+knitr::kable(
+  tabla_metricas_ppo,
+  caption = "PPO: desempeño en la muestra de prueba independiente (métricas ponderadas por fexp)",
+  col.names = c("Modelo / regla", "Exactitud (%)", "Exactitud balanceada (%)", "QWK",
+                "Sens. cat. 1 (%)", "Sens. cat. 2 (%)", "Sens. cat. 3 (%)", "Sens. cat. 4 (%)", "Sens. cat. 5 (%)",
+                "AUC insatisfacción (Y ≤ 2)"),
+  digits = c(0, 1, 1, 3, 1, 1, 1, 1, 1, 3), align = c("l", rep("c", 9)), row.names = FALSE
+)
+m_arg <- tabla_metricas_ppo[1, ]; m_bal <- tabla_metricas_ppo[2, ]; m_base <- tabla_metricas_ppo[3, ]
+```
+
+* **La exactitud engaña:** La línea base acierta el `r fx(m_base$Exactitud, 1)` % sin usar ningún predictor. La regla de la clase más probable alcanza `r fx(m_arg$Exactitud, 1)` %, pero tiene una exactitud balanceada de `r fx(m_arg$Exactitud_Balanceada, 1)` %, porque casi no detecta las categorías de insatisfacción (sensibilidad de `r fx(m_arg$Sens_2, 1)` % en la categoría 2).
+* **La regla balanceada** sacrifica exactitud bruta (`r fx(m_bal$Exactitud, 1)` %) para detectar la insatisfacción: su sensibilidad sube a `r fx(m_bal$Sens_1, 1)` % en la categoría 1 y `r fx(m_bal$Sens_2, 1)` % en la 2, con un QWK de `r fx(m_bal$QWK, 3)` frente a `r fx(m_arg$QWK, 3)` de la clase más probable.
+* **Alerta de insatisfacción:** Usando la probabilidad predicha de $Y \le 2$ como puntaje de riesgo, el PPO alcanza un **AUC de `r fx(auc_ppo, 3)`** en la prueba. Según Hosmer et al. (2013), `r if (auc_ppo >= 0.8) 'es una discriminación excelente' else if (auc_ppo >= 0.7) 'es una discriminación aceptable' else 'es una discriminación pobre'`.
+
+### 11.5 XGBoost: ajuste por validación cruzada y evaluación en la misma prueba
+
+XGBoost se entrenó sobre **la misma partición y las mismas imputaciones** que el PPO:
+
+* **Imputación múltiple:** las 5 bases imputadas del entrenamiento se apilaron, con cada persona 5 veces y peso $\text{fexp}/5$. En la evaluación se promediaron las probabilidades predichas de las 5 versiones de cada persona.
+* **Desbalance:** se usaron pesos sensibles al costo, $\text{fexp} \times 1/\pi_k$, el mismo criterio que la regla balanceada del PPO.
+* **Hiperparámetros:** se eligieron por **validación cruzada de 5 pliegues formados por conglomerados completos** dentro del entrenamiento, maximizando el QWK. Se exploraron `r n_configs` configuraciones al azar (Bergstra & Bengio, 2012), con una profundidad de árbol entre 2 y 9. El rango se amplió porque en el análisis previo el óptimo quedó en el borde (6).
+
+```{r tabla-cv-xgb, echo=FALSE}
+knitr::kable(
+  head(cv_resumen_xgb[, c('config', 'n_estimators', 'max_depth', 'learning_rate', 'subsample',
+                          'min_child_weight', 'qwk_media', 'qwk_de')], 5),
+  caption = "XGBoost: 5 mejores combinaciones en validación cruzada por conglomerados (QWK medio entre pliegues)",
+  col.names = c("Configuración", "Árboles", "Profundidad", "Tasa de aprendizaje", "Submuestreo",
+                "Peso mínimo por hoja", "QWK medio", "DE entre pliegues"),
+  digits = c(0, 0, 0, 4, 2, 1, 3, 3), align = c("l", rep("c", 7)), row.names = FALSE
+)
+```
+
+La configuración elegida tiene profundidad `r mejor_xgb$max_depth`, `r mejor_xgb$n_estimators` árboles y tasa de aprendizaje `r fx(mejor_xgb$learning_rate, 4)`. `r if (mejor_xgb$max_depth %in% c(2, 9)) 'Su profundidad vuelve a quedar en el borde del rango explorado, por lo que una búsqueda más amplia podría mejorarla levemente.' else 'Su profundidad queda dentro del rango explorado, por lo que la búsqueda no está limitada por el borde.'` La diferencia de QWK con las siguientes configuraciones es menor que la variación entre pliegues (DE $= `r gsub(',', '{,}', fx(mejor_xgb$qwk_de, 3))`$), así que la elección exacta de hiperparámetros no es decisiva.
+
+#### Estructura del modelo XGBoost final
+
+A diferencia del PPO, XGBoost **no tiene coeficientes**. El modelo es una **suma de árboles de decisión**. Para cada categoría de satisfacción $k = 1, \dots, 5$, construye un puntaje sumando el aporte de `r mejor_xgb$n_estimators` árboles, y luego convierte los cinco puntajes en probabilidades con la función *softmax*:
+
+$$F_k(\mathbf{x}_i) = \sum_{t=1}^{`r mejor_xgb$n_estimators`} f_{t,k}(\mathbf{x}_i), \qquad \widehat{P}(Y_i = k \mid \mathbf{x}_i) = \frac{\exp\{F_k(\mathbf{x}_i)\}}{\sum_{m=1}^{5} \exp\{F_m(\mathbf{x}_i)\}}$$
+
+Cada árbol $f_{t,k}$ hace preguntas sí/no sobre los predictores (por ejemplo: ¿tiene humedad?, ¿la vivienda es arrendada?) hasta llegar a una **hoja**, que suma un pequeño valor $\omega$ al puntaje de la categoría $k$. Un valor positivo aumenta la probabilidad de esa categoría y uno negativo la disminuye. Cada aporte se multiplica además por la tasa de aprendizaje, para que ningún árbol domine.
+
+```{r ficha-xgboost, echo=FALSE}
+arboles_xgb <- xgboost::xgb.model.dt.tree(model = modelo_xgb_train)
+n_arboles <- length(unique(arboles_xgb$Tree))
+n_hojas <- sum(arboles_xgb$Feature == 'Leaf')
+ficha_xgb <- data.frame(
+  Elemento = c('Objetivo (función de pérdida)', 'Categorías de respuesta', 'Rondas de boosting',
+               'Árboles en total', 'Hojas en total (reglas terminales)', 'Profundidad máxima de cada árbol',
+               'Tasa de aprendizaje (η)', 'Submuestreo de personas por árbol', 'Peso mínimo por hoja (min_child_weight)',
+               'Regularización (λ, α)', 'Predictores', 'Ponderación',
+               'Datos de entrenamiento', 'Selección de hiperparámetros'),
+  Valor = c('multi:softprob (entropía cruzada multiclase ponderada)', '5 (escala de satisfacción)',
+            as.character(mejor_xgb$n_estimators),
+            sprintf('%d (%d rondas × 5 categorías)', n_arboles, mejor_xgb$n_estimators),
+            format(n_hojas, big.mark = '.'),
+            as.character(mejor_xgb$max_depth), fx(mejor_xgb$learning_rate, 4),
+            paste0(fx(100 * mejor_xgb$subsample, 0), ' %'), fx(mejor_xgb$min_child_weight, 1),
+            'λ = 1, α = 0',
+            sprintf('%d columnas 0/1 (one-hot de las %d variables del PPO)', ncol(tr$X), length(pred)),
+            'fexp × 1/π_k (corrección del desbalance de clases)',
+            sprintf('%s personas de entrenamiento × 5 imputaciones = %s filas (peso fexp/5)',
+                    format(length(filas_train), big.mark = '.'), format(nrow(tr$X), big.mark = '.')),
+            sprintf('Validación cruzada de 5 pliegues por conglomerados (%d configuraciones, máximo QWK)', n_configs))
+)
+knitr::kable(ficha_xgb, caption = 'Ficha técnica del modelo XGBoost final (evaluado en la prueba independiente)',
+             col.names = c('Elemento', 'Valor'), align = c('l', 'l'))
+```
+
+**Ejemplo: el primer árbol de la categoría «Totalmente insatisfecho».** Para que el modelo no sea una caja negra, la siguiente tabla traduce a reglas el primer árbol de esa categoría. Cada fila es una hoja: el camino de preguntas que lleva a ella, su valor $\omega$ y su cobertura, que es la suma de hessianos ponderados e indica cuántas personas, en términos de peso, caen en esa regla. Los `r n_arboles - 1` árboles restantes tienen la misma forma y van corrigiendo los errores de los anteriores.
+
+```{r reglas-arbol-xgb, echo=FALSE}
+# Traduce el nombre de una columna one-hot a «Variable = categoría»
+limpiar_nivel <- function(x) sub('^[0-9]+\\. ', '', x)
+arbol <- as.data.frame(arboles_xgb[arboles_xgb$Tree == 0, ])
+# XGBoost envía a 'Yes' cuando x < Split. Con columnas 0/1 y Split = 1: Yes = NO tiene esa categoría.
+# Variables de dos categorías: se nombra directamente la categoría del camino (sin «≠»).
+condicion <- function(fila, rama) {
+  v <- unname(variable_columna[fila$Feature])
+  nivel <- substring(fila$Feature, nchar(v) + 1)
+  niveles <- levels(b[[v]])
+  tiene <- rama == 'No'
+  if (length(niveles) == 2) {
+    valor <- limpiar_nivel(if (tiene) nivel else setdiff(niveles, nivel))
+    sprintf('%s: %s', nombre_var[[v]], valor)
+  } else {
+    sprintf('%s %s «%s»', nombre_var[[v]], if (tiene) '=' else '≠', limpiar_nivel(nivel))
+  }
+}
+caminos <- list()
+recorrer <- function(id, ruta) {
+  fila <- arbol[arbol$ID == id, ]
+  if (fila$Feature == 'Leaf') {
+    caminos[[length(caminos) + 1]] <<- data.frame(Reglas = paste(ruta, collapse = '  ∧  '),
+                                                   Valor = fila$Gain, Cobertura = fila$Cover)
+    return(invisible())
+  }
+  recorrer(fila$Yes, c(ruta, condicion(fila, 'Yes')))
+  recorrer(fila$No, c(ruta, condicion(fila, 'No')))
+}
+recorrer('0-0', character(0))
+reglas_arbol1 <- do.call(rbind, caminos)
+reglas_arbol1 <- reglas_arbol1[order(-reglas_arbol1$Valor), ]
+knitr::kable(
+  reglas_arbol1,
+  caption = 'Primer árbol de la categoría «Totalmente insatisfecho»: una fila por hoja (ω > 0 aumenta el riesgo de insatisfacción total)',
+  col.names = c('Camino de decisión hasta la hoja', 'Valor de la hoja (ω)', 'Cobertura'),
+  digits = c(0, 4, 1), align = c('l', 'c', 'c'), row.names = FALSE
+)
+hoja_max <- reglas_arbol1[1, ]
+```
+
+La hoja que más **aumenta** el puntaje de insatisfacción total en este primer árbol ($\omega = `r gsub(',', '{,}', fx(hoja_max$Valor, 4))`$) corresponde al perfil: *`r hoja_max$Reglas`*. Un solo árbol aporta poco. La predicción final suma `r mejor_xgb$n_estimators` árboles por categoría, y por eso la importancia de cada variable se resume con la ganancia (*Gain*) acumulada en todos ellos (sección «Triangulación» más adelante) y no leyendo árboles individuales.
+
+### 11.6 Comparación predictiva PPO vs. XGBoost en la prueba independiente
+
+```{r tabla-comparacion-test, echo=FALSE}
+knitr::kable(
+  tabla_comparacion_test,
+  caption = paste0("PPO vs. XGBoost en la MISMA muestra de prueba (", format(length(y_te), big.mark = '.', decimal.mark = ','),
+                   " personas; métricas ponderadas por fexp)"),
+  col.names = c("Modelo", "Exactitud (%)", "Exactitud balanceada (%)", "QWK",
+                "Sens. cat. 1 (%)", "Sens. cat. 2 (%)", "Sens. cat. 3 (%)", "Sens. cat. 4 (%)", "Sens. cat. 5 (%)",
+                "AUC insatisfacción (Y ≤ 2)"),
+  digits = c(0, 1, 1, 3, 1, 1, 1, 1, 1, 3), align = c("l", rep("c", 9)), row.names = FALSE
+)
+m_ppo <- tabla_comparacion_test[1, ]; m_xgb <- tabla_comparacion_test[2, ]
+dif_auc <- auc_ppo - auc_xgb
+```
+
+* **Discriminación de la insatisfacción:** el AUC es `r fx(auc_ppo, 3)` para el PPO y `r fx(auc_xgb, 3)` para XGBoost. La diferencia (PPO − XGBoost $= `r gsub(',', '{,}', fx(dif_auc, 3))`$) tiene un IC 95% bootstrap por conglomerados de [`r fx(ic_dif_auc[1], 3)`; `r fx(ic_dif_auc[2], 3)`]. `r if (ic_dif_auc[1] < 0 & ic_dif_auc[2] > 0) '**Ambos modelos discriminan igual**: la diferencia no es distinguible de cero.' else if (dif_auc > 0) 'El PPO discrimina significativamente mejor.' else 'XGBoost discrimina significativamente mejor.'`
+* **Acuerdo ordinal:** el QWK es `r fx(m_ppo$QWK, 3)` (PPO) frente a `r fx(m_xgb$QWK, 3)` (XGBoost), y la exactitud balanceada es `r fx(m_ppo$Exactitud_Balanceada, 1)` % frente a `r fx(m_xgb$Exactitud_Balanceada, 1)` %.
+* **Lectura para la consultoría:** `r if (abs(dif_auc) < 0.02) 'la flexibilidad de los árboles (interacciones y no linealidades) no aporta capacidad predictiva relevante sobre un modelo ordinal bien especificado. Esto respalda usar el PPO, que además es interpretable y entrega inferencia con diseño muestral, como modelo principal, y XGBoost como verificación independiente.' else 'la diferencia de capacidad predictiva entre ambos modelos es apreciable, y debe sopesarse frente a la interpretabilidad del PPO.'`
+
+#### Matrices de confusión
+
+Cada celda muestra **qué porcentaje de las personas de una categoría real** (fila) fue clasificado en cada categoría predicha (columna), ponderando por el factor de expansión. La diagonal es la sensibilidad de cada categoría. Las celdas cercanas a la diagonal son errores leves, de una categoría, y las lejanas son errores graves, los que más castiga el QWK.
+
+```{r grafico-matrices-confusion, echo=FALSE, fig.height=4.8, fig.width=10}
+ggplot(confusion_ambos, aes(Predicha, Real, fill = Pct)) +
+  geom_tile(color = 'white', linewidth = 0.6) +
+  geom_text(aes(label = fx(Pct, 1), color = Pct > 45), size = 3.4, fontface = 'bold') +
+  scale_color_manual(values = c(`TRUE` = 'white', `FALSE` = 'grey15'), guide = 'none') +
+  scale_fill_gradient(low = '#f7fbff', high = '#174C63', limits = c(0, 100), name = '% de la\ncategoría real') +
+  facet_wrap(~ Modelo) +
+  scale_x_discrete(labels = c('1\nTot. insat.', '2\nInsat.', '3\nIndif.', '4\nSatisf.', '5\nTot. satisf.')) +
+  scale_y_discrete(labels = c('5 Tot. satisf.', '4 Satisf.', '3 Indif.', '2 Insat.', '1 Tot. insat.')) +
+  coord_equal() +
+  theme_minimal(base_size = 11) +
+  labs(title = 'Matrices de confusión en la muestra de prueba independiente',
+       subtitle = 'Porcentaje de cada categoría real (fila) asignado a cada categoría predicha; ponderado por fexp',
+       x = 'Categoría predicha', y = 'Categoría real') +
+  theme(plot.title = element_text(face = 'bold'), panel.grid = element_blank(),
+        strip.text = element_text(face = 'bold', size = 11))
+diag_ppo <- diag(100 * sweep(as.matrix(matriz_confusion_ppo_bal), 1, rowSums(matriz_confusion_ppo_bal), '/'))
+diag_xgb <- diag(100 * sweep(as.matrix(matriz_confusion_xgb), 1, rowSums(matriz_confusion_xgb), '/'))
+vecinos <- function(M) { M <- as.matrix(M); 100 * sum(M[abs(row(M) - col(M)) <= 1]) / sum(M) }
+```
+
+* **Patrón común:** Ninguno de los dos modelos clasifica bien a nivel individual. La mayor sensibilidad es la de la categoría 5, con `r fx(diag_ppo[5], 1)` % en el PPO y `r fx(diag_xgb[5], 1)` % en XGBoost. La categoría 4, la más frecuente, se reparte entre sus vecinas porque la regla balanceada deja de favorecerla.
+* **Gravedad de los errores:** El `r fx(vecinos(matriz_confusion_ppo_bal), 1)` % de las predicciones del PPO y el `r fx(vecinos(matriz_confusion_xgb), 1)` % de las de XGBoost caen en la categoría correcta o en una contigua. Los errores tienden a ser leves, lo que explica que el QWK supere claramente a la línea base pese a la baja exactitud exacta.
+* **Diferencia entre modelos:** El PPO detecta más a los totalmente insatisfechos (`r fx(diag_ppo[1], 1)` % frente a `r fx(diag_xgb[1], 1)` %), y XGBoost más a los insatisfechos (`r fx(diag_xgb[2], 1)` % frente a `r fx(diag_ppo[2], 1)` %).
+
+#### Curvas ROC de la alerta de insatisfacción ($Y \le 2$)
+
+La curva ROC muestra, para cada umbral de riesgo posible, qué fracción de los insatisfechos se detecta (sensibilidad) a cambio de qué fracción de falsas alarmas entre los no insatisfechos (1 − especificidad). Cuanto más se acerca la curva a la esquina superior izquierda, mejor discrimina el modelo. La diagonal es el azar (AUC = 0,5).
+
+```{r grafico-roc, echo=FALSE, fig.height=5.5, fig.width=6.5}
+ggplot(roc_ambos, aes(FPR, TPR, color = Modelo)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 'dashed', color = 'grey55') +
+  geom_step(linewidth = 0.9, direction = 'hv') +
+  scale_color_manual(values = c('#174C63', '#C8944B')) +
+  coord_equal() +
+  scale_x_continuous(labels = function(x) paste0(100 * x, ' %')) +
+  scale_y_continuous(labels = function(x) paste0(100 * x, ' %')) +
+  theme_minimal(base_size = 11) +
+  labs(title = 'Curvas ROC: alerta de insatisfacción en la prueba',
+       subtitle = 'Puntaje de riesgo = P(Y ≤ 2) predicha; ponderado por fexp',
+       x = 'Falsas alarmas (1 − especificidad)', y = 'Insatisfechos detectados (sensibilidad)', color = NULL) +
+  theme(plot.title = element_text(face = 'bold'), legend.position = 'bottom')
+punto_roc <- function(modelo_txt, objetivo = 0.7) {
+  r <- roc_ambos[startsWith(roc_ambos$Modelo, modelo_txt), ]
+  r$FPR[which(r$TPR >= objetivo)[1]]
+}
+```
+
+Las dos curvas casi se superponen, lo que concuerda con la diferencia de AUC no significativa. Como referencia operativa: para detectar al 70 % de los insatisfechos, el PPO genera falsas alarmas en el `r fx(100 * punto_roc('PPO'), 1)` % de los no insatisfechos y XGBoost en el `r fx(100 * punto_roc('XGBoost'), 1)` %. Por eso la probabilidad predicha sirve para **ordenar** hogares por riesgo y priorizar visitas de postventa, pero no para clasificarlos con certeza.
+
+### Triangulación de Resultados: Convergencia entre Logit y XGBoost
+Los dos modelos provienen de paradigmas distintos: una regresión paramétrica acumulada y un ensamble de árboles potenciados por gradiente. Por eso, compararlos permite ver qué parte del diagnóstico constructivo es robusta al método y qué parte depende de él.
+
+```{r tabla-convergencia-mostrar, echo=FALSE}
+tabla_convergencia_def$Pos_PPO <- rank(-tabla_convergencia_def$Dominancia_Logit_Pct)
+tabla_convergencia_def$Pos_XGB <- rank(-tabla_convergencia_def$Ganancia_XGBoost_Pct)
+knitr::kable(
+  tabla_convergencia_def[, c('Deficiencia', 'AME_PPO_pp', 'Dominancia_Logit_Pct', 'Pos_PPO',
+                             'Ganancia_XGBoost_Pct', 'Pos_XGB')],
+  caption = "Triangulación de las deficiencias físicas: PPO (modelo final) vs. XGBoost",
+  col.names = c("Deficiencia", "AME PPO sobre P(Y ≥ 4) (pp)", "Peso PPO (Shapley %)", "Posición PPO",
+                "Peso XGBoost (Gain %)", "Posición XGBoost"),
+  digits = c(0, 1, 1, 0, 1, 0),
+  align = c("l", "c", "c", "c", "c", "c"), row.names = FALSE
+)
+rho_rank <- cor(tabla_convergencia_def$Dominancia_Logit_Pct, tabla_convergencia_def$Ganancia_XGBoost_Pct,
+                method = 'spearman')
+top2_ppo <- tabla_convergencia_def$Deficiencia[tabla_convergencia_def$Pos_PPO <= 2]
+top2_xgb <- tabla_convergencia_def$Deficiencia[tabla_convergencia_def$Pos_XGB <= 2]
+mayor_brecha <- tabla_convergencia_def[which.max(abs(tabla_convergencia_def$Pos_PPO - tabla_convergencia_def$Pos_XGB)), ]
+```
+
+* **Coincidencia:** La correlación de rangos de Spearman entre ambas jerarquías es $\rho = `r gsub(',', '{,}', fx(rho_rank, 2))`$. `r if (setequal(top2_ppo, top2_xgb)) paste0('Las dos fallas principales son las mismas en ambos modelos (', paste(tolower(sort(top2_ppo)), collapse = ' y '), '), por lo que esta prioridad es robusta al método.') else paste0('Las dos fallas principales difieren: PPO destaca ', paste(tolower(top2_ppo), collapse = ' y '), ' y XGBoost ', paste(tolower(top2_xgb), collapse = ' y '), '.')`
+* **Discrepancia:** La mayor diferencia de posición se da en **`r tolower(mayor_brecha$Deficiencia)`**, en el lugar `r mayor_brecha$Pos_PPO` del PPO y el `r mayor_brecha$Pos_XGB` de XGBoost. La razón está en lo que mide cada peso. XGBoost mide la ganancia predictiva de las divisiones de los árboles, que incluye interacciones y efectos que el PPO atribuye a otros predictores. El PPO mide la contribución explicativa neta, controlando por todo lo demás. Por eso, fallas con efecto neto pequeño o nulo en el PPO, como el calor (`r fx(pesos_deficiencias[['vv3']], 1)` % en PPO frente a `r fx(pct_gain_def[['vv3']], 1)` % en XGBoost) o el ruido (`r fx(pesos_deficiencias[['vv1_d']], 1)` % frente a `r fx(pct_gain_def[['vv1_d']], 1)` %), pueden igual ser útiles para separar casos dentro de un árbol.
+
+### Visualización de Importancia Relativa en XGBoost
+
+El siguiente gráfico ilustra el porcentaje de Ganancia (*Gain*) que aporta cada variable al ensamble de árboles, distinguiendo entre deficiencias físicas de la vivienda y variables de entorno/control:
+
+```{r grafico-importancia-xgb, echo=FALSE, fig.height=6.2, fig.width=8.5}
+ggplot(tabla_importancia_xgb, aes(x = reorder(Nombre, Pct_Gain), y = Pct_Gain, fill = Tipo)) +
+  geom_col(width = 0.72) +
+  geom_text(aes(label = sprintf("%.1f %%", Pct_Gain)), hjust = -0.15, size = 3.2, fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = c("Deficiencia Constructiva" = "#C8944B", "Control Sociodemográfico / Entorno" = "#174C63")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Jerarquía de Importancia de Variables en XGBoost (Ganancia Relativa)",
+    subtitle = "Aporte porcentual a la reducción de impureza en las divisiones del ensamble de árboles",
+    x = NULL,
+    y = "Porcentaje de Ganancia (%)",
+    fill = "Categoría de Variable",
+    caption = "Fuente: XGBoost multiclase reentrenado con la base completa imputada (100 %, 5 imputaciones apiladas), EBS 2023."
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 13),
+    axis.text.y = element_text(size = 9.5)
+  )
+```
+
+* **Hallazgo Clave de la Triangulación:**
+  1. **Humedad y frío:** En XGBoost, la humedad o goteras (`vv1_a`) concentra el `r fx(pct_gain_def[['vv1_a']], 1)` % de la ganancia atribuible a las fallas de la vivienda y el frío (`vv2`) el `r fx(pct_gain_def[['vv2']], 1)` %. Juntas suman `r fx(pct_gain_def[['vv1_a']] + pct_gain_def[['vv2']], 1)` %, frente al `r fx(pesos_deficiencias[['vv1_a']] + pesos_deficiencias[['vv2']], 1)` % en el PPO.
+  2. **Controles con mayor ganancia:** `r ctrl_top <- head(tabla_importancia_xgb[tabla_importancia_xgb$Tipo != 'Deficiencia Constructiva', ], 3); paste0(tolower(ctrl_top$Nombre), ' (', fx(ctrl_top$Pct_Gain, 1), ' %)', collapse = ', ')`. Son las variables no constructivas que más ayudan a XGBoost a separar niveles de satisfacción. En conjunto, las seis deficiencias reúnen el `r fx(sum(tabla_importancia_xgb$Pct_Gain[tabla_importancia_xgb$Tipo == 'Deficiencia Constructiva']), 1)` % de la ganancia total.
+
+---
+
+## 12. Conclusiones y Recomendaciones Estratégicas para la Inmobiliaria
+
+```{r datos-conclusiones, include=FALSE}
+a_def <- setNames(split(ame_ppo, ame_ppo$Codigo), ame_ppo$Codigo)
+top7 <- head(tabla_doble_ranking$Nombre_Corto, 7)
+```
+
+**Hallazgos del estudio**
+
+1. **Humedad y frío son las fallas que más pesan, y la prioridad es robusta al método.** En el modelo final (PPO), la humedad o goteras reduce la satisfacción alta en **`r fx(abs(a_def$vv1_a$AME_alta_pp), 1)` pp** y el frío en **`r fx(abs(a_def$vv2$AME_alta_pp), 1)` pp**. Juntas concentran el `r fx(pesos_deficiencias[['vv1_a']] + pesos_deficiencias[['vv2']], 1)` % de la importancia explicativa de las seis deficiencias (Shapley). XGBoost, con un método completamente distinto, las ubica también en los dos primeros lugares (`r fx(pct_gain_def[['vv1_a']] + pct_gain_def[['vv2']], 1)` % de la ganancia). La falta de ventilación es el tercer foco (`r fx(abs(a_def$vv1_c$AME_alta_pp), 1)` pp).
+2. **La humedad actúa sobre todo en el paso de la insatisfacción a la satisfacción.** Es la única deficiencia cuyo efecto cambia a lo largo de la escala, en ambas muestras (completa y entrenamiento). Su efecto es máximo justo en el margen que separa a un cliente insatisfecho o indiferente de uno satisfecho, que es el margen relevante para la postventa.
+3. **El calor no muestra un efecto neto distinguible de cero** (AME de `r fx(a_def$vv3$AME_alta_pp, 1)` pp, IC 95%: `r fx(a_def$vv3$LI_alta, 1)` a `r fx(a_def$vv3$LS_alta, 1)`). XGBoost le asigna una ganancia predictiva moderada (`r fx(pct_gain_def[['vv3']], 1)` %), lo que indica que puede ayudar a anticipar casos en combinación con otras variables, pero no que sea un determinante propio. **No se recomienda descartarlo**, sino tratarlo como prioridad secundaria frente a humedad y frío.
+4. **El déficit se concentra en un bloque territorial continuo.** Los siete primeros lugares del ranking PPO son `r paste(top7, collapse = ', ')`. Ambos rankings coinciden en lo grueso ($\rho = `r gsub(',', '{,}', fx(rho_ranking, 2))`$), pero las posiciones individuales tienen intervalos amplios y deben leerse por grupos.
+5. **El Maule:** Ocupa el lugar `r maule_rk$Pos_PPO` en el ranking PPO y el `r maule_rk$Pos_XGB` en XGBoost. Tiene `r fx(maule_rk$vv1_a, 1)` % de viviendas con humedad y, aun así, una satisfacción observada alta (`r fx(maule_rk$Sat_Alta, 1)` %). Esa ventaja no es propia del territorio: ajustada por covariables, la brecha frente al resto del país es de `r fx(ppo_m$Diferencia_pp, 2)` pp `r if (ppo_m$LI_95 < 0 & ppo_m$LS_95 > 0) '(no significativa)' else '(significativa)'`.
+6. **Predecir la insatisfacción individual es difícil, pero ordenar por riesgo es posible.** El PPO y XGBoost discriminan igual en la prueba independiente (AUC `r fx(auc_ppo, 3)` y `r fx(auc_xgb, 3)`; diferencia no significativa). La flexibilidad de los árboles no aporta sobre el modelo ordinal, que además es interpretable.
+
+**Recomendaciones para Constructora Independencia**
+
+1. **Priorizar en obra el control de humedad:** impermeabilización de cubiertas, muros y radieres, sellos de vanos, barreras de vapor y control de condensación. Es la partida con mayor retorno esperado en satisfacción.
+2. **Tratar la aislación térmica contra el frío como segunda prioridad**, con especial atención a los proyectos DS19 del bloque O'Higgins–Los Lagos, donde la exposición es mayor.
+3. **Asegurar ventilación adecuada** (renovación de aire, extracción en baños y cocinas), que además reduce la condensación y, por lo tanto, la humedad.
+4. **Focalizar la gestión territorial por grupos de regiones, no por posición exacta.** El bloque centro-sur (incluido el Maule) concentra el déficit. Las diferencias de posición entre regiones vecinas en el ranking no son concluyentes.
+5. **Usar el PPO como herramienta principal de análisis y respaldo técnico**, y XGBoost como verificación independiente. Si la empresa quiere un sistema de alerta temprana con sus propios clientes, la probabilidad predicha de insatisfacción puede **ordenar** a los hogares por riesgo, pero debe validarse primero con datos propios de postventa.
+
+**Limitaciones**
+
+* Los resultados son **asociaciones ajustadas**, no efectos causales: la encuesta es transversal y la percepción de las fallas la declara el mismo encuestado.
+* La EBS mide la satisfacción con la vivienda actual de toda la población adulta, no específicamente la de clientes de viviendas nuevas o del programa DS19.
+* La imputación supone que los datos faltan al azar condicional a lo observado (MAR); con menos del 3 % de casos incompletos, su influencia es pequeña (sección 4).
+* Los pesos de los índices se tratan como fijos al calcular los intervalos regionales, por lo que esos intervalos subestiman levemente la incertidumbre total.
+
+---
+
+## 13. Referencias Bibliográficas
+
+* **Agresti, A. (2013).** *Categorical Data Analysis* (3rd ed.). John Wiley & Sons. Hoboken, New Jersey.
+* **Bergstra, J., & Bengio, Y. (2012).** Random search for hyper-parameter optimization. *Journal of Machine Learning Research*, 13, 281–305.
+* **Chen, T., & Guestrin, C. (2016).** XGBoost: A scalable tree boosting system. In *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining* (pp. 785–794).
+* **Christensen, R. (2025).** *Log-Linear Models and Logistic Regression* (3rd ed.). Springer. Cham, Switzerland. https://doi.org/10.1007/978-3-031-69038-9
+* **Cohen, J. (1968).** Weighted kappa: Nominal scale agreement with provision for scaled disagreement or partial credit. *Psychological Bulletin*, 70(4), 213–220.
+* **Enders, C. K. (2010).** *Applied Missing Data Analysis*. The Guilford Press. New York.
+* **Gutiérrez Rojas, H. A. (2016).** *Estrategias de muestreo: diseño de encuestas y estimación de parámetros*. Ediciones de la U. Bogotá, Colombia.
+* **Hastie, T., Tibshirani, R., & Friedman, J. (2009).** *The Elements of Statistical Learning: Data Mining, Inference, and Prediction* (2nd ed.). Springer. New York.
+* **Hosmer, D. W., Lemeshow, S., & Sturdivant, R. X. (2013).** *Applied Logistic Regression* (3rd ed.). John Wiley & Sons. Hoboken, New Jersey.
+* **Instituto Nacional de Estadísticas - INE. (2020).** *Fundamentos del estándar para la evaluación de la calidad de las estimaciones en encuestas de hogares*. Documento Técnico, Departamento de Metodologías e Innovación Estadística, Santiago, Chile.
+* **Lohr, S. L. (2000).** *Muestreo: diseño y análisis*. International Thomson Editores. México, D.F.
+* **Lumley, T. (2010).** *Complex Surveys: A Guide to Analysis Using R*. John Wiley & Sons. Hoboken, New Jersey.
+* **Luchman, J. N. (2014).** Relative Importance Analysis with Multi-category Dependent Variables: An Extension and Review of Best Practices. *Organizational Research Methods*, 17(4), 452–471.
+* **Manríquez García, N. (2023).** Determining elements of housing satisfaction in Mexico: analysis by estimating an Ordered Probit Model. *Vivienda y Comunidades Sustentables*, 7(14), 71–86.
+* **McCullagh, P. (1980).** Regression Models for Ordinal Data. *Journal of the Royal Statistical Society: Series B (Methodological)*, 42(2), 109–142.
+* **Ministerio de Desarrollo Social y Familia - MDSF. (2024).** *Encuesta de Bienestar Social 2023 (EBS 2023): Documento Metodológico y Base de Datos*. Gobierno de Chile.
+* **O'Brien, R. M. (2007).** A Caution Regarding Rules of Thumb for Variance Inflation Factors. *Quality & Quantity*, 41(5), 673–690.
+* **Peterson, B., & Harrell, F. E. (1990).** Partial proportional odds models for ordinal response variables. *Journal of the Royal Statistical Society: Series C (Applied Statistics)*, 39(2), 205–217.
+* **Shmueli, G. (2010).** To explain or to predict? *Statistical Science*, 25(3), 289–310.
+* **van Buuren, S. (2018).** *Flexible Imputation of Missing Data* (2nd ed.). Chapman & Hall/CRC. Boca Raton, Florida.
+* **Williams, R. (2006).** Generalized Ordered Logit/Partial Proportional Odds Models for Ordinal Dependent Variables. *The Stata Journal*, 6(1), 58–82.
+* **Williams, R. (2016).** Understanding and interpreting generalized ordered logit models. *The Journal of Mathematical Sociology*, 40(1), 7–20.
+* **Yee, T. W. (2015).** *Vector Generalized Linear and Additive Models: With an Implementation in R*. Springer. New York.
