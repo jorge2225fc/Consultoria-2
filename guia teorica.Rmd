@@ -1,0 +1,1007 @@
+---
+title: "Habitabilidad y satisfacción con la vivienda: desarrollo del análisis EBS 2023"
+subtitle: "EBS 2023 · Diseño muestral, imputación, modelos ordinales, XGBoost y análisis territorial"
+author: "Germán Lara, Martín Reyes y Jorge Correa"
+date: "13 de noviembre de 2026"
+lang: es
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    mathjax: default
+    self_contained: true
+---
+
+<style>
+body {font-size:16px; line-height:1.7; color:#243447;}
+h1,h2,h3 {color:#183d56;}
+h1 {margin-top:38px; border-bottom:2px solid #dce8ee; padding-bottom:9px;}
+h2 {margin-top:28px;}
+table {font-size:14px; margin:20px 0;}
+th {background:#edf4f7;}
+blockquote {border-left:4px solid #28768b; background:#f3f8fa; padding:12px 18px;}
+</style>
+
+# Pregunta de investigación y alcance de las conclusiones
+
+## Qué se busca responder
+
+La pregunta central es: ¿cómo se relacionan las deficiencias de habitabilidad con la satisfacción con la vivienda, una vez que se consideran las diferencias socioeconómicas, demográficas, territoriales y del entorno? De ella se desprenden otras preguntas: qué deficiencias se relacionan más con la satisfacción; si esa relación cambia a lo largo de la escala de satisfacción; qué tan bien se pueden anticipar las respuestas; y en qué regiones se concentran las deficiencias más relevantes.
+
+El análisis tiene tres componentes y cada uno responde una pregunta distinta. El modelo explicativo describe cómo se relaciona cada deficiencia con la satisfacción cuando se comparan personas con las mismas demás características. El componente predictivo revisa si un procedimiento anticipa bien respuestas que no usó para aprender. El índice territorial combina cuánto se presenta cada deficiencia en cada región con la importancia de esa deficiencia.
+
+## Tipo de encuesta y alcance
+
+La EBS es una encuesta transversal: registra en un solo momento las respuestas de cada persona, que informa tanto su satisfacción como las deficiencias de su vivienda. Los resultados describen, por ejemplo, que la humedad se relaciona con una menor satisfacción con la vivienda. La literatura sobre satisfacción residencial respalda la elección de las variables de control (Díaz-Serrano, 2009; Martínez Ibarra et al., 2017).
+
+Para Constructora e Inmobiliaria Independencia, el análisis sirve para orientar hipótesis y prioridades técnicas. La encuesta es nacional y no permite identificar a los clientes de la empresa ni a los compradores de un programa habitacional específico.
+
+# Variables y preparación de los datos
+
+Una covariable o predictor es una característica que se incorpora al análisis para estudiar su relación con la respuesta. Una estimación es un valor calculado con la muestra para aproximar una característica de toda la población. Un modelo es una fórmula matemática que describe esas relaciones.
+
+Antes de calcular resultados se define qué representa cada columna de la base. La respuesta es lo que se quiere estudiar: la satisfacción con la vivienda. Los predictores son las condiciones que se relacionan con ella. Preparar los datos consiste en identificar el papel de cada variable, ordenar sus categorías y distinguir una respuesta válida de un dato faltante. El resultado es una base que sirve para todos los métodos posteriores.
+
+## Respuesta ordinal
+
+La pregunta de satisfacción, identificada en la base como `a9`, se transforma en una respuesta ordenada $Y$. Se escribe $Y_i$ para indicar la respuesta de la persona $i$:
+
+| Valor | Categoría |
+|:--:|:--|
+| 1 | Totalmente insatisfecho |
+| 2 | Insatisfecho |
+| 3 | Indiferente |
+| 4 | Satisfecho |
+| 5 | Totalmente satisfecho |
+
+El orden tiene significado, pero la distancia entre 1 y 2 no tiene por qué ser igual a la distancia entre 4 y 5. Un modelo ordinal usa el orden de las categorías sin suponer que están a la misma distancia (McCullagh, 1980; Agresti, 2013).
+
+Para resumir los resultados se usan dos eventos: satisfacción alta, $Y\geq4$ (satisfecho o totalmente satisfecho), e insatisfacción, $Y\leq2$ (insatisfecho o totalmente insatisfecho). Entre ambos no cubren todas las respuestas, porque la categoría 3, “Indiferente”, queda fuera de los dos. Sus probabilidades se obtienen de un modelo que conserva las cinco categorías.
+
+## Las seis deficiencias centrales
+
+| Código | Deficiencia | Comparación del modelo |
+|:--|:--|:--|
+| `vv1_a` | Humedad o goteras | Sí frente a No |
+| `vv1_b` | Escasez de luz natural | Sí frente a No |
+| `vv1_c` | Falta de ventilación | Sí frente a No |
+| `vv1_d` | Ruidos molestos | Sí frente a No |
+| `vv2` | Frío en la vivienda | Sí frente a No |
+| `vv3` | Calor en la vivienda | Sí frente a No |
+
+Aunque los códigos originales usan 1 para Sí y 2 para No, se toma No como categoría de referencia, es decir, como el grupo con el que se compara. Así, el coeficiente de cada deficiencia (el número que el modelo asigna a esa variable) compara a quienes la presentan con quienes no la presentan, cuando el resto de los predictores toma los mismos valores.
+
+## Los 18 controles utilizados
+
+| Bloque | Códigos y significado |
+|:--|:--|
+| Condiciones habitacionales | `ind_hacina_casen`: hacinamiento; `hh_d_estado_casen`: conservación; `ten_viv_casen`: tenencia |
+| Posición económica y laboral | `qaut_casen`: quintil de ingreso autónomo; `activ_ebs`: condición de actividad |
+| Características personales | `tramoebs2`: edad agrupada; `sg01`: sexo; `l3_recat`: estado civil; `educacion`: educación construida |
+| Entorno | `g2`: medio ambiente comunal; `g3_a`: contaminación del aire; `g3_f`: basura |
+| Problemas barriales | `v36a_casen`: rayados o daños; `v36b_casen`: consumo de drogas/alcohol; `v36c_casen`: tráfico de drogas |
+| Seguridad y territorio | `h2_c`: seguridad nocturna al caminar; `glosa_area`: área rural/urbana; `territorio`: Maule/resto del país |
+
+El modelo tiene 24 variables predictoras, pero muchos más coeficientes. Una variable categórica (o factor) con cinco niveles necesita cuatro indicadores (columnas que valen 1 o 0), uno por cada nivel distinto del de referencia. Además, la escala de satisfacción tiene cuatro cortes, es decir, cuatro puntos que separan las cinco respuestas. Por ejemplo, uno de los cortes separa a quienes están satisfechos o totalmente satisfechos de quienes eligieron alguna de las otras tres respuestas. En el modelo de odds parcialmente proporcionales (PPO), que se explica más adelante, algunos indicadores tienen un coeficiente distinto en cada corte.
+
+Los controles se incluyen porque es razonable que se relacionen con la habitabilidad o con la evaluación de la vivienda. Se eligen según la pregunta de investigación; un valor p alto (véase la sección del contraste de Wald) no basta por sí solo para eliminarlos.
+
+## Recodificaciones que cambian la interpretación
+
+Los códigos `-88` y `-99` se tratan como faltantes. La categoría `-77`, “Otra”, se conserva en educación: una respuesta válida no debe convertirse automáticamente en ausencia de información.
+
+La educación se construye con `l4`, `l5_recat` y `educ_recat_casen`. El territorio se obtiene de la región y compara el Maule con el resto del país, que actúa como referencia. El hacinamiento alto y el crítico se agrupan en una sola categoría. Esto evita problemas de cálculo cuando una categoría tiene pocas personas, pero supone que ambas condiciones pueden tratarse juntas; por eso hay que revisar los conteos y que la agrupación tenga sentido.
+
+Los predictores se tratan como variables categóricas en las que cada categoría se compara con una categoría de referencia, aunque algunas tengan un orden natural. Así no se impone que pasar de una categoría a la siguiente tenga siempre la misma relación con la satisfacción. La respuesta, en cambio, sí conserva su orden.
+
+# Diseño muestral complejo y factor de expansión
+
+Una vez definidas las variables, se determina cómo pasar de las personas entrevistadas a la población que representan. Dos preguntas orientan esta etapa: cuánto pesa cada entrevista y cuánta información independiente aporta. El factor de expansión responde a la primera; los estratos y conglomerados intervienen en la segunda. Por eso los porcentajes y los intervalos de confianza (rangos de valores compatibles con los datos, que se explican en la sección del índice regional) se calculan considerando los tres componentes.
+
+## Por qué las personas no aportan el mismo peso
+
+Una encuesta puede seleccionar grupos con probabilidades distintas. El factor de expansión $w_i$ indica el peso que recibe la observación $i$ para estimar características de la población cubierta. Una representación general de su construcción es:
+
+$$
+w_i=\frac{1}{\pi_i}\,a_i\,g_i,
+$$
+
+donde $\pi_i$ es la probabilidad de que la persona sea seleccionada, $a_i$ un ajuste por las personas que no respondieron y $g_i$ un ajuste de calibración, que hace coincidir los totales de la muestra con totales conocidos de la población. Esta fórmula muestra los componentes habituales de un factor de expansión; no es la fórmula oficial de la EBS. El código usa el `fexp` que ya viene en la base.
+
+Para una variable binaria $D_i$, la proporción ponderada se estima mediante:
+
+$$
+\widehat p=\frac{\sum_{i\in s}w_iD_i}{\sum_{i\in s}w_i}.
+$$
+
+El denominador es la suma de pesos del dominio analizado, es decir, del grupo de la población que se estudia. Por ejemplo, la prevalencia de una deficiencia en el Maule (el porcentaje de personas que la reportan) se calcula sobre la población representada en el Maule. La cantidad de entrevistas es distinta de la población que esas entrevistas representan (Cochran, 1977; Gutiérrez, 2016).
+
+## Estratos, conglomerados y objeto de diseño
+
+El diseño se declara con `estrato_ebs` como estrato, `varunit` como conglomerado o unidad primaria de muestreo (UPM) y `fexp` como peso. La estratificación divide la selección en grupos; los conglomerados reconocen que las personas seleccionadas dentro de una misma unidad pueden parecerse entre sí. Ese parecido cambia la precisión de las estimaciones.
+
+Ponderar una regresión solo con `fexp` no equivale a incorporar el diseño completo. En el trabajo, `survey` y `svyVGAM` combinan pesos, estratos y conglomerados para calcular las estimaciones y sus matrices de covarianza, que resumen la incertidumbre de cada coeficiente y cómo varían juntos. En XGBoost se usan pesos y particiones por conglomerado, pero eso no entrega intervalos ni contrastes de encuesta como los del PPO.
+
+Al analizar un subgrupo, si primero se construye el diseño y luego se estima dentro del subgrupo, se conserva la información del diseño para calcular la varianza. Filtrar filas antes de declarar el diseño puede cambiar ese cálculo.
+
+## Efecto de diseño y tamaño efectivo
+
+$$
+\operatorname{DEFF}(\widehat\theta)=
+\frac{\operatorname{Var}_{d}(\widehat\theta)}
+{\operatorname{Var}_{MAS}(\widehat\theta)}.
+$$
+
+El efecto de diseño (DEFF) compara la varianza de una estimación, que mide cuánto podría cambiar de una muestra a otra, con la que tendría si la muestra fuera un sorteo simple de personas. El numerador corresponde al diseño real de la encuesta y el denominador a ese muestreo aleatorio simple. Si el DEFF es 2, la varianza es el doble y el error estándar (la raíz cuadrada de la varianza) es $\sqrt{2}$ veces el de referencia. Cada variable y cada dominio tiene su propio DEFF.
+
+Una aproximación útil es $n_{\mathrm{efectivo}}\approx n/\operatorname{DEFF}$: el número de personas que, en un sorteo simple, daría la misma precisión. No debe confundirse con la aproximación de Kish, $(\sum_iw_i)^2/\sum_iw_i^2$, que solo refleja cuán desiguales son los pesos y no incorpora los estratos ni los conglomerados. Tampoco existe un tamaño mínimo que asegure precisión en cada región: depende de la prevalencia, del error estándar y del diseño. El documento del INE (2020) fundamenta la evaluación de calidad de las estimaciones.
+
+## Taylor, grados de libertad y estratos con una UPM
+
+La linealización de Taylor aproxima un cálculo complejo mediante la suma de los aportes de cada persona y mide cuánto varían esos aportes entre conglomerados de un mismo estrato. Con ella se obtienen los errores estándar y los contrastes que respetan el diseño.
+
+Los grados de libertad indican cuánta información independiente hay para estimar la variabilidad; en una encuesta se suelen calcular como el número de UPM menos el número de estratos. La implementación usa esos grados de libertad de diseño y, en algunos resultados combinados, los ajusta según la imputación. Cuando un estrato tiene una sola UPM, no se puede medir la variación dentro de él de la forma habitual; la opción `lonely.psu = 'adjust'` aplica una convención de cálculo para esos casos.
+
+# Datos faltantes e imputación múltiple
+
+El siguiente paso identifica qué respuestas faltan y en qué personas. Eliminar a toda persona con algún dato faltante desperdicia información y puede cambiar la composición del grupo analizado. Por eso se generan varias versiones plausibles de los valores faltantes, se repite el análisis en cada versión y se combinan los resultados. Las diferencias entre versiones reflejan que, aunque el dato se complete, su valor real sigue siendo incierto.
+
+## Cuánto falta y por qué importa
+
+El informe registra 11.234 personas y 10.935 casos completos (personas sin ningún dato faltante): 299 personas tienen al menos un dato faltante en la respuesta o en los predictores, aproximadamente 2,66 %. Los faltantes de cada variable no se suman para contar personas incompletas, porque una misma persona puede tener varios.
+
+La tabla exportada identifica 171 faltantes en seguridad nocturna, 54 en educación y 12 en satisfacción. Que falte poco limita el posible problema, pero no asegura que la razón por la que faltan los datos sea inofensiva.
+
+## MCAR, MAR y MNAR
+
+Para decidir cómo completar los datos se considera por qué podrían faltar. Los tres mecanismos siguientes se diferencian en si el dato falta por características que sí se observan, por el mismo valor que falta o por ninguna de ellas.
+
+Sea $R$ un indicador de si el dato fue respondido y $Z=(Z_{obs},Z_{mis})$ el conjunto de datos completos, formado por la parte observada y la parte faltante.
+
+| Mecanismo | Expresión conceptual | Significado |
+|:--|:--|:--|
+| MCAR | $P(R\mid Z)=P(R)$ | La ausencia no depende de los valores de las variables |
+| MAR | $P(R\mid Z)=P(R\mid Z_{obs})$ | Puede depender de lo observado, sin dependencia adicional de lo faltante |
+| MNAR | La dependencia de $Z_{mis}$ persiste | La ausencia depende de valores no observados aun tras condicionar |
+
+Por ejemplo, si la falta de respuesta depende de la edad, que sí se observa, el caso puede ser MAR. Si las personas muy insatisfechas tienden a no responder la pregunta de satisfacción, incluso entre personas con las mismas características observadas, el caso puede ser MNAR. El análisis supone MAR dado el modelo de imputación; ese supuesto no se puede comprobar del todo con los datos observados (Enders, 2010).
+
+## Cómo funciona MICE
+
+MICE imputa, es decir, completa, cada variable con datos faltantes a partir de las demás variables mediante un modelo. Repite este paso varias veces, agregando variación aleatoria, y genera varias bases completas plausibles. El trabajo usa cinco imputaciones (cinco bases completas) y diez iteraciones (diez rondas de actualización).
+
+| Tipo de variable | Modelo condicional utilizado | Idea |
+|:--|:--|:--|
+| Binaria | `logreg` | Regresión logística |
+| Ordinal | `polr` | Modelo acumulado que respeta categorías ordenadas |
+| Nominal | `polyreg` | Logit multinomial |
+
+La región y el logaritmo de `fexp` se usan como variables auxiliares: ayudan a completar los datos, pero no se imputan. `territorio` no se usa para imputar porque se obtiene directamente de la región. Las auxiliares ligadas al diseño ayudan a conservar sus relaciones, pero no equivalen a un modelo de imputación que represente cada UPM por separado.
+
+MICE no reemplaza un dato faltante por el valor verdadero: genera valores plausibles y refleja la incertidumbre sobre ellos bajo los supuestos del modelo. Diez iteraciones no aseguran que el proceso se haya estabilizado, ni cinco imputaciones que los resultados sean estables. Por eso hay que revisar los gráficos de evolución de las iteraciones, la distribución de los valores imputados, las categorías con pocas personas, los avisos del proceso y si los resultados cambian al aumentar el número de imputaciones.
+
+## Reglas de Rubin
+
+Sea $\widehat\theta_l$ la estimación en la imputación $l$, $U_l$ su varianza y $m$ el número de imputaciones:
+
+$$
+\overline\theta=\frac1m\sum_{l=1}^{m}\widehat\theta_l,
+\qquad
+\overline U=\frac1m\sum_{l=1}^{m}U_l,
+$$
+
+$$
+B=\frac1{m-1}\sum_{l=1}^{m}(\widehat\theta_l-\overline\theta)^2,
+\qquad
+T=\overline U+\left(1+\frac1m\right)B.
+$$
+
+$\overline U$ resume la incertidumbre dentro de cada base y $B$ la variación entre imputaciones. El error estándar combinado es $\sqrt T$. Cuando se combinan varios coeficientes a la vez, las diferencias se reemplazan por productos exteriores y se obtiene una matriz de covarianza. En este trabajo, cada $U_l$ incorpora el diseño de la encuesta.
+
+Para una razón de odds (OR, que se define en la sección del modelo logit ordenado) se combinan primero los coeficientes en escala logarítmica y después se aplica la exponencial. Para un efecto marginal (el cambio en una probabilidad, que se explica en la sección de efectos marginales) se calculan el efecto y su varianza en cada imputación y luego se combinan. Promediar probabilidades para predecir es otra operación y no entrega por sí sola un intervalo de Rubin.
+
+Comparar los resultados con casos completos y con imputación permite ver si cambian según cómo se traten los faltantes. Si son parecidos, los resultados son estables frente a esa decisión, aunque eso no prueba que el mecanismo sea MAR.
+
+# Modelo logit ordenado
+
+Con las variables preparadas y el diseño definido, se relaciona la satisfacción con las seis deficiencias y los controles. El punto de partida es un modelo que conserva las cinco categorías y estima la probabilidad de superar cada nivel de satisfacción. Primero se explica cómo se construye; después se comprueba si sus supuestos se ajustan a los datos.
+
+## Qué estima y por qué se usa aquí
+
+El logit ordenado es un modelo de regresión para una respuesta categórica cuyas alternativas tienen un orden. En este estudio se pasa desde «Totalmente insatisfecho» hasta «Totalmente satisfecho». Ese orden permite distinguir una respuesta más alta de otra, pero no asigna una distancia numérica conocida entre ambas. Los números 1 a 5 identifican posiciones de la escala; no son cantidades de satisfacción medidas en una unidad común.
+
+La tarea del modelo es estimar cinco probabilidades para cada combinación de características. Para una persona con determinada edad, tenencia, entorno y condiciones de vivienda, se obtiene una probabilidad de cada respuesta. Las cinco deben estar entre 0 y 1 y sumar uno. El modelo también resume cómo se asocian los predictores con ubicarse en niveles superiores de la escala (McCullagh, 1980; Agresti, 2013).
+
+Una regresión lineal aplicada directamente a los códigos trataría como iguales los cambios de 1 a 2 y de 4 a 5. Un logit binario de satisfacción alta permitiría estudiar solo la separación entre 4–5 y 1–3. El logit ordenado conserva las cinco alternativas sin exigir esas distancias y aprovecha información que se perdería al reducir toda la respuesta a dos grupos.
+
+## Cómo se forman los cuatro cortes
+
+En lugar de analizar cada categoría como si no tuviera relación con las demás, se comparan grupos acumulados. Con cinco respuestas hay cuatro maneras de separar categorías inferiores y superiores:
+
+| Corte $j$ | Hasta el corte: $Y\leq j$ | Por encima del corte: $Y>j$ |
+|:--:|:--|:--|
+| 1 | Totalmente insatisfecho | Insatisfecho, indiferente, satisfecho o totalmente satisfecho |
+| 2 | Totalmente insatisfecho o insatisfecho | Indiferente, satisfecho o totalmente satisfecho |
+| 3 | Totalmente insatisfecho, insatisfecho o indiferente | Satisfecho o totalmente satisfecho |
+| 4 | Todas las respuestas salvo totalmente satisfecho | Totalmente satisfecho |
+
+El corte 3 corresponde al resumen de satisfacción alta usado en el estudio. El corte 2 permite obtener insatisfacción como $P(Y\leq2)$. El corte 4 distingue llegar a la respuesta más alta. Son comparaciones distintas calculadas dentro del mismo modelo.
+
+Una persona participa en las cuatro definiciones acumuladas, pero su respuesta sigue siendo una sola. La estimación del logit ordenado utiliza la probabilidad de su categoría observada, no trata esas cuatro definiciones como entrevistas independientes. Los cuatro logits binarios que aparecen después se utilizan para el diagnóstico del paralelismo.
+
+## Cómo entran las características de las personas
+
+Los predictores se reúnen en una puntuación o predictor lineal:
+
+$$
+\eta_i=\mathbf{x}_i^{\top}\boldsymbol\beta
+=\beta_1x_{i1}+\beta_2x_{i2}+\cdots+\beta_px_{ip}.
+$$
+
+Aquí $p$ cuenta las columnas de la matriz de predictores, que pueden ser más que las 24 variables originales porque cada factor se representa con indicadores. Para una deficiencia, el indicador vale 1 si está presente y 0 si está ausente. Para tenencia, por ejemplo, cada categoría distinta de la referencia recibe su propio indicador y coeficiente.
+
+Si dos perfiles tienen iguales características salvo la humedad, su diferencia en $\eta$ es el coeficiente de humedad. Un coeficiente positivo desplaza la distribución hacia niveles superiores y uno negativo hacia inferiores. Esta lectura compara perfiles bajo el modelo y condiciona en los demás predictores. Si se incluyeran interacciones, habría que considerar también sus términos; la fórmula aditiva mostrada corresponde a la estructura usada como punto de partida.
+
+Aunque $\eta_i$ sea una suma lineal, las probabilidades obtenidas después son funciones no lineales de esa suma. Por eso un mismo coeficiente no implica una misma diferencia de probabilidad para todos los perfiles.
+
+## Representación latente e identificabilidad
+
+El modelo puede entenderse como si cada persona tuviera una satisfacción continua que no se observa directamente (satisfacción latente):
+
+$$
+Y_i^*=\mathbf{x}_i^{\top}\boldsymbol\beta+\varepsilon_i,
+\qquad \varepsilon_i\sim\operatorname{Logística}(0,1).
+$$
+
+$i$ identifica a la persona; $\mathbf{x}_i$ reúne sus predictores codificados; $\boldsymbol\beta$ contiene sus coeficientes; y $\mathbf{x}_i^{\top}\boldsymbol\beta$ suma los aportes de esos predictores. $\varepsilon_i$ representa la variación que el modelo no explica. En esta representación se fija su distribución logística con localización 0 y escala 1; no se está afirmando que la respuesta observada sea continua o logística.
+
+La respuesta que da la persona depende de entre qué umbrales cae esa satisfacción latente:
+
+$$
+Y_i=k\quad\Longleftrightarrow\quad
+\theta_{k-1}<Y_i^*\leq\theta_k,
+$$
+
+con $\theta_0=-\infty$, $\theta_5=+\infty$ y cuatro umbrales internos ordenados, que corresponden a los cuatro cortes de la escala. La escala del error se fija y el intercepto general queda incluido en los umbrales; si se estimaran libremente, el modelo no tendría una única solución (falta de identificación). Esta representación da sustento al modelo restringido, en el que cada predictor tiene la misma pendiente en todos los cortes; el PPO permite una estructura más flexible.
+
+Los umbrales son parámetros que se estiman; no son los números 1, 2, 3 y 4 ni se fijan necesariamente en 1,5; 2,5; 3,5 y 4,5. Indican los límites en la escala latente entre los cuales cae cada respuesta. Si a la puntuación latente y a todos los umbrales se agregara la misma constante, las respuestas observadas serían las mismas. Por eso se necesita fijar la localización y evitar un intercepto libre adicional a todos los umbrales.
+
+La satisfacción latente es una forma de explicar la construcción del modelo, no un dato que la encuesta haya medido aparte. La interpretación práctica se realiza mediante probabilidades, coeficientes y contrastes estimados.
+
+## Una convención de signos coherente
+
+Definiendo $F(t)=1/(1+e^{-t})$, el logit ordenado del trabajo satisface:
+
+$$
+P(Y_i\leq j\mid\mathbf{x}_i)=F(\theta_j-\mathbf{x}_i^{\top}\boldsymbol\beta),
+\qquad j=1,2,3,4.
+$$
+
+$F$ es la función logística acumulada: transforma cualquier número real en una probabilidad entre 0 y 1. El símbolo $\mid\mathbf{x}_i$ indica que la probabilidad se calcula para una persona con esas características. $j$ representa un corte, no una categoría predicha.
+
+La fórmula se obtiene directamente de la representación latente. Si $Y_i\leq j$, entonces $Y_i^*\leq\theta_j$. Al sustituir $Y_i^*=\eta_i+\varepsilon_i$, la condición se convierte en $\varepsilon_i\leq\theta_j-\eta_i$. La probabilidad de esa condición es precisamente $F(\theta_j-\eta_i)$, porque $F$ es la distribución acumulada del error logístico.
+
+La función logit transforma una probabilidad $u$ en $\log\{u/(1-u)\}$. Así se pasa de una probabilidad limitada entre 0 y 1 a una escala que puede tomar cualquier valor real. Con la convención acumulada inferior se tiene:
+
+$$
+\operatorname{logit}P(Y_i\leq j\mid\mathbf{x}_i)
+=\theta_j-\eta_i.
+$$
+
+La expresión equivalente para superar cada corte es:
+
+$$
+\log\frac{P(Y_i>j\mid\mathbf{x}_i)}{P(Y_i\leq j\mid\mathbf{x}_i)}
+=-\theta_j+\mathbf{x}_i^{\top}\boldsymbol\beta.
+$$
+
+Así, un coeficiente positivo aumenta los odds de ubicarse por encima del corte, es decir, la probabilidad de estar sobre el corte dividida por la de no estarlo (más abajo se explica con un ejemplo); uno negativo los reduce. Pasar de $P(Y>j)$ a $P(Y\leq j)$ cambia el signo de la pendiente. Por eso los coeficientes de `svyolr` y los del PPO estimado con `reverse = TRUE` tienen el mismo sentido.
+
+Las probabilidades de categoría se recuperan por diferencias. Si $C_j=P(Y\leq j)$:
+
+$$
+p_1=C_1,\quad p_2=C_2-C_1,\quad p_3=C_3-C_2,
+\quad p_4=C_4-C_3,\quad p_5=1-C_4.
+$$
+
+## Qué significa que las pendientes sean comunes
+
+En el modelo inicial cada corte tiene su propio umbral, pero todos utilizan el mismo vector de pendientes $\boldsymbol\beta$. En consecuencia, al comparar dos perfiles que difieren en un predictor, la razón de odds de superar el corte es la misma para los cuatro cortes. Esa es la restricción de odds proporcionales.
+
+Para humedad, la restricción significa que el mismo OR se aplicaría a superar cualquiera de los cuatro cortes. Esto simplifica la descripción: se estima una asociación común en lugar de cuatro diferentes. Esa simplificación debe contrastarse con los datos y no se deduce del orden de la respuesta.
+
+En términos de la ecuación superior, las rectas de los cuatro logits tienen interceptos distintos y pendientes iguales. De ahí el nombre de «líneas paralelas». No se exige que los porcentajes observados sean iguales entre grupos ni que las curvas de probabilidad estén separadas por una distancia constante.
+
+La sección siguiente explica cómo se contrasta esta restricción. Cuando algunas covariables requieren pendientes diferentes se utiliza el PPO, manteniendo claro qué términos son comunes y cuáles cambian según el corte.
+
+## De los cortes a las cinco probabilidades
+
+El modelo no ajusta cinco respuestas independientes. Primero estima probabilidades acumuladas y después obtiene cada categoría restando acumulaciones consecutivas. Así evita contar dos veces a una persona y permite que las cinco probabilidades sumen uno.
+
+Para el resumen de satisfacción alta se suman las probabilidades de las categorías 4 y 5: $P(Y\geq4)=p_4+p_5=1-C_3$. Para insatisfacción se suman las de las categorías 1 y 2: $P(Y\leq2)=p_1+p_2=C_2$. Así, los dos indicadores se calculan a partir de las cinco respuestas, sin tener que ajustar un modelo nuevo para cada resumen.
+
+En general, si se define $C_0=0$ y $C_5=1$, cualquier categoría se obtiene mediante $p_k=C_k-C_{k-1}$. Los umbrales ordenados y las pendientes comunes garantizan el orden de las acumuladas para un perfil dado. Esa coherencia es la que permite interpretar las diferencias como probabilidades válidas.
+
+Un coeficiente positivo aumenta la probabilidad de superar cada corte, pero no necesariamente aumenta la probabilidad de cada categoría intermedia. Por ejemplo, la categoría «Satisfecho» puede ganar probabilidad por personas que se desplazan desde niveles inferiores y perderla por personas que pasan a «Totalmente satisfecho». Por eso se calculan explícitamente las probabilidades del evento que interesa.
+
+## Pseudoverosimilitud y estimación de incertidumbre
+
+Una expresión del criterio ponderado es:
+
+$$
+\ell_w(\boldsymbol\beta,\boldsymbol\theta)=
+\sum_{i\in s}\widetilde w_i\sum_{k=1}^{5}
+\mathbb{1}(Y_i=k)\log p_{ik},
+$$
+
+donde $\widetilde w_i$ son los pesos, llevados a una escala definida; $p_{ik}$ es la probabilidad estimada de la categoría $k$ para la persona $i$; y $\mathbb{1}(Y_i=k)$ vale 1 cuando esa fue su respuesta y 0 en otro caso. Así, cada persona aporta el logaritmo de la probabilidad de la categoría que realmente respondió. Se buscan los parámetros que dan la mayor probabilidad ponderada a las respuestas observadas. Los errores estándar y contrastes usan la covarianza del diseño, porque la muestra no es un sorteo simple de personas independientes.
+
+Los umbrales y las pendientes se estiman conjuntamente mediante optimización numérica. Se proponen valores, se calculan las cinco probabilidades y se actualizan los parámetros para mejorar el criterio. La convergencia indica que el algoritmo ha alcanzado una solución según su regla numérica; no demuestra por sí sola que se cumplan los supuestos.
+
+El estudio utiliza `survey::svyolr` con enlace logístico. Los factores de expansión intervienen en la estimación y la estructura de estratos y UPM en el cálculo de la incertidumbre. Para las bases imputadas se estima el modelo en cada una y después se combinan los parámetros y sus covarianzas mediante Rubin. El ajuste por casos completos permite una comparación de sensibilidad.
+
+El resultado incluye pendientes para los indicadores y cuatro umbrales. Los primeros se relacionan con características de personas y viviendas; los segundos separan respuestas. No se interpretan los umbrales como si fueran asociaciones de una deficiencia ni se toma su exponencial como un OR entre grupos.
+
+## Odds ratio y diferencia de probabilidades
+
+La probabilidad expresa la frecuencia esperada de un evento entre todos los casos posibles. Los odds comparan la probabilidad de que ocurra con la de que no ocurra: si la probabilidad es $p$, los odds son $p/(1-p)$. Por ejemplo, una probabilidad hipotética de 0,80 equivale a odds de 4, porque 0,80/0,20 = 4. Una razón de odds (OR) compara ese cociente entre dos grupos.
+
+Para un predictor binario con pendiente común:
+
+$$
+\operatorname{OR}_k=e^{\beta_k}.
+$$
+
+Un OR menor que 1 indica menores odds de superar el corte respecto de la categoría de referencia; uno mayor que 1 indica mayores odds. La comparación mantiene las demás covariables constantes. El porcentaje de diferencia en los odds se obtiene de $100(OR-1)$; la diferencia entre probabilidades requiere calcular las probabilidades para los perfiles que se comparan.
+
+Un intervalo para el OR se obtiene aplicando la exponencial a los extremos del intervalo de $\beta_k$. Un OR igual a 1, o un coeficiente igual a 0, representa ausencia de asociación condicional en ese término y esa especificación. Que un intervalo incluya ese valor no demuestra que la asociación sea exactamente nula. Los umbrales solo separan las categorías de respuesta; no miden la relación con ninguna deficiencia.
+
+## Qué muestra el logit restringido en este análisis
+
+El ajuste inicial por casos completos utiliza 10.935 personas y las 24 variables predictoras. La tabla siguiente recoge los coeficientes y OR de las seis deficiencias del modelo de referencia. Cada comparación es presencia frente a ausencia, con el resto de los predictores incluidos.
+
+| Deficiencia | Coeficiente | OR común | IC del 95 % del OR |
+|:--|--:|--:|:--|
+| Humedad o goteras | -0,734 | 0,480 | [0,427; 0,539] |
+| Escasez de luz natural | -0,214 | 0,807 | [0,690; 0,944] |
+| Falta de ventilación | -0,443 | 0,642 | [0,533; 0,775] |
+| Ruidos molestos | -0,151 | 0,860 | [0,766; 0,966] |
+| Frío | -0,480 | 0,619 | [0,546; 0,701] |
+| Calor | -0,044 | 0,957 | [0,853; 1,072] |
+
+Por ejemplo, el coeficiente de humedad es aproximadamente −0,734 y su OR es 0,480. Bajo la restricción inicial, esto representa odds de superar cada corte aproximadamente 52 % menores que en el perfil comparable sin humedad. No significa una reducción de 52 puntos porcentuales en satisfacción. Para calor, el intervalo del OR incluye 1, por lo que ese ajuste no distingue una asociación diferente de cero en la escala del coeficiente.
+
+Estos resultados se conservan como referencia, porque el contraste global rechaza el supuesto de pendientes comunes. Por ello no se toma el OR único de humedad como descripción final de toda la escala: el PPO permite estimar un OR para cada corte. El cambio de modelo responde al diagnóstico y no a que un procedimiento sea más complejo que otro.
+
+# Supuestos, diagnósticos y contraste de paralelismo
+
+Ajustar un modelo entrega números, pero falta comprobar si pueden interpretarse como el modelo supone. En esta etapa se revisa si las categorías tienen información suficiente, si los predictores repiten demasiada información entre sí y si una misma relación sirve para los cuatro cortes de satisfacción. Con estas comprobaciones se decide si mantener el modelo inicial o hacerlo más flexible.
+
+## Qué exige el modelo
+
+| Condición | Relevancia y revisión |
+|:--|:--|
+| Orden correcto de la respuesta | Confirmar cuestionario, etiquetas y codificación |
+| Especificación apropiada | Revisar covariables, posibles interacciones y que las combinaciones de interés aparezcan en la encuesta |
+| Identificabilidad | Evitar columnas redundantes y categorías sin información |
+| Ausencia de separación problemática | Revisar cruces con pocas personas, que el ajuste converja y errores estándar extremos |
+| Colinealidad controlada | Evaluar dependencia entre predictores mediante GVIF |
+| Odds proporcionales | Contrastar igualdad de pendientes entre cortes |
+| Diseño e imputación adecuados | Revisar pesos, UPM, estratos y supuestos de faltantes |
+
+La separación ocurre cuando una combinación de categorías predice perfectamente la respuesta; entonces el modelo no puede estimar bien sus coeficientes. Una interacción es una relación que cambia según el valor de otra variable. No se exige que los predictores ni la respuesta sigan una distribución normal. Tratar los controles como categorías evita imponer una tendencia lineal entre sus niveles, aunque no incorpora interacciones que no estén en el modelo ni corrige errores de medición.
+
+## Qué significa odds proporcionales
+
+Con cinco categorías existen cuatro comparaciones, una por corte: $Y>1$ frente a $Y\leq1$, y de la misma forma para los cortes 2, 3 y 4. Por ejemplo, el corte 3 compara a quienes están satisfechos o totalmente satisfechos ($Y>3$) con quienes eligieron alguna de las otras tres respuestas. El modelo restringido permite un intercepto distinto en cada corte, pero exige que cada predictor tenga la misma pendiente en todos:
+
+$$
+H_0:\beta_{k1}=\beta_{k2}=\beta_{k3}=\beta_{k4}.
+$$
+
+Esto significa que el predictor $k$ tiene un mismo OR en los cuatro cortes. No significa que la diferencia en probabilidades sea la misma ni que las categorías estén a igual distancia.
+
+## Contraste de Wald ajustado al diseño
+
+Un contraste estadístico compara una hipótesis con la variación que cabe esperar en los datos. Aquí la hipótesis inicial es que las pendientes son iguales en todos los cortes. El valor p indica qué tan poco compatibles son los datos con esa hipótesis: un valor p pequeño sugiere que las pendientes difieren. No es la probabilidad de que la hipótesis sea verdadera. Se usa 0,05 como límite para decidir, junto con la estabilidad y validez del modelo.
+
+El código ajusta cuatro regresiones logísticas, una por corte, cada una con una respuesta de dos valores (por encima o no del corte). Luego calcula su covarianza conjunta con funciones de influencia apiladas, porque las cuatro respuestas pertenecen a las mismas personas y comparten el diseño.
+
+Si $C$ reúne las restricciones de igualdad y $\widehat V$ es la covarianza conjunta:
+
+$$
+W=(C\widehat{\boldsymbol\beta})^{\top}
+(C\widehat V C^{\top})^{-1}
+(C\widehat{\boldsymbol\beta}).
+$$
+
+Con $r$ restricciones puede usarse una aproximación $F=W/r$ con grados de libertad de diseño. La implementación aplica un contraste global y uno por variable. Este procedimiento no es el test de Brant clásico, que no considera el diseño de la encuesta.
+
+Rechazar la hipótesis indica que las pendientes iguales no se ajustan a los datos, pero no dice cuál es la mejor alternativa. No rechazarla tampoco demuestra que sean exactamente iguales. Los contrastes por variable se hacen sin corrección por multiplicidad (sin ajustar por estar haciendo muchas pruebas a la vez), por lo que son exploratorios: al hacer muchas pruebas aumenta la posibilidad de detectar diferencias por azar.
+
+## Resultado del contraste y decisión adoptada
+
+En la muestra completa de casos válidos, el contraste global de paralelismo entrega $F=2{,}266$, con 144 restricciones y 7.412 grados de libertad en el denominador; el valor p es menor que 0,001. La decisión es rechazar la igualdad conjunta de pendientes. El contraste global no identifica por sí solo qué variable necesita cambiar: para eso se examinan los contrastes por variable y los ajustes PPO candidatos.
+
+Los candidatos iniciales son rayados o daños en el barrio, tramo etario, sexo, medio ambiente comunal y humedad. La selección del código utiliza los valores p por variable sin ajuste, al nivel 0,05. Aunque la salida también informa valores ajustados por Holm, esos no son la regla que decide los candidatos del PPO. Es importante distinguir la columna que se informa de la regla que efectivamente se usa.
+
+Se vuelve a comprobar el paralelismo en entrenamiento para la evaluación predictiva. Esto permite revisar si el diagnóstico se sostiene al reservar la prueba y evita usar esa prueba para elegir qué relaciones se liberan.
+
+## GVIF y multicolinealidad
+
+Para un predictor numérico aislado, una referencia conocida es:
+
+$$
+\operatorname{VIF}_k=\frac1{1-R_k^2},
+$$
+
+donde $R_k^2$ indica qué parte de ese predictor puede explicarse con los demás predictores. La multicolinealidad ocurre cuando un predictor repite buena parte de la información de otros. Una variable categórica con varios indicadores necesita una medida conjunta: el GVIF de Fox y Monette (1992). Para comparar variables con distinto número de indicadores se usa:
+
+$$
+\operatorname{GVIF}^{1/(2d)},
+$$
+
+donde $d$ es el número de indicadores de la variable. Esta medida no está en la misma escala que el VIF habitual: si $d=1$, equivale a la raíz cuadrada del VIF. Por eso los límites de 5 o 10 que se usan para el VIF no se aplican directamente a ella. O'Brien (2007) advierte contra decidir solo con límites fijos.
+
+La colinealidad puede agrandar los errores estándar y hacer inestables los coeficientes. Para eliminar un control hay que valorar cuánta información repite, cuánto mejora la precisión y qué representa; el diagnóstico por sí solo no obliga a retirarlo.
+
+# Modelo de odds parcialmente proporcionales: PPO
+
+El diagnóstico muestra que algunas relaciones no se resumen bien con una misma pendiente en toda la escala. Por eso se modifica el modelo: algunas variables mantienen una sola pendiente y otras reciben una pendiente distinta en cada corte. Así se representa esa diferencia, se conserva el orden de las respuestas y se verifica que las probabilidades resultantes sean válidas.
+
+## Por qué se utiliza
+
+Una covariable puede relacionarse de forma distinta con salir de la insatisfacción que con llegar a la satisfacción total. El PPO da pendientes propias por corte a esas covariables y mantiene una pendiente común para las demás (Williams, 2006, 2016):
+
+$$
+\operatorname{logit}P(Y_i>j\mid\mathbf{x}_i,\mathbf{z}_i)
+=\alpha_j+\mathbf{x}_i^{\top}\boldsymbol\beta+
+\mathbf{z}_i^{\top}\boldsymbol\gamma_j,
+\qquad j=1,\ldots,4.
+$$
+
+$\mathbf{x}$ contiene los términos paralelos (con la misma pendiente en todos los cortes) y $\mathbf{z}$ los términos liberados (con una pendiente por corte). Los primeros tienen un OR común, $e^{\beta_k}$; los segundos, un OR por corte, $e^{\gamma_{kj}}$. Los OR se siguen interpretando igual; la diferencia es que una variable cuya relación cambia entre cortes ya no se resume con un solo OR.
+
+## Qué cambia entre el logit inicial y el PPO
+
+El logit inicial permite cuatro interceptos, pero un solo coeficiente para cada indicador predictor. El PPO mantiene esa estructura para los términos paralelos y reemplaza el coeficiente de cada indicador liberado por cuatro coeficientes, uno por corte. «Liberar» significa permitir que esos cuatro valores se estimen por separado; no significa retirar la variable del análisis.
+
+En la ecuación, $\alpha_j$ es el intercepto del corte $j$ y corresponde a $-\theta_j$ en la convención anterior. $\mathbf{x}_i^{\top}\boldsymbol\beta$ suma los aportes comunes, mientras que $\mathbf{z}_i^{\top}\boldsymbol\gamma_j$ suma los aportes que cambian por corte. Para una variable categórica de varios niveles, cada indicador respecto de su referencia puede tener su propio conjunto de coeficientes por corte.
+
+Esta flexibilidad conserva el orden de satisfacción y utiliza menos parámetros que liberar todas las variables en un logit ordenado generalizado. Las alternativas que se consideran en el trabajo son:
+
+| Alternativa | Qué permite | Decisión en este análisis |
+|:--|:--|:--|
+| Logit ordenado restringido | Una pendiente por indicador en los cuatro cortes | Se conserva como referencia tras el rechazo global |
+| PPO | Pendientes distintas solo para términos seleccionados | Se utiliza como modelo ordinal final |
+| Logit ordenado generalizado completo | Pendientes distintas para todos los términos | No se adopta; aumenta la cantidad de parámetros y la exigencia de estabilidad |
+| Regresión lineal | Trata los códigos como una escala numérica de distancias iguales | No se adopta para representar las cinco categorías ordinales |
+| Logit multinomial | Estima categorías sin aprovechar su orden | No es la alternativa elegida para esta respuesta ordenada |
+
+Esta tabla resume las opciones discutidas en «Modelo Completo»; no atribuye a las alternativas descartadas resultados que no se hayan estimado.
+
+## Selección de las asociaciones que varían entre cortes
+
+Los candidatos a liberar salen del contraste por variable. Se prueban uno a uno, y un término queda liberado si el modelo sigue entregando probabilidades válidas y el contraste dentro del PPO resulta significativo.
+
+En la selección hecha con la muestra completa se liberan rayados o daños en el barrio, sexo, medio ambiente comunal y humedad o goteras. El tramo etario queda paralelo porque, al liberarlo, el modelo entrega probabilidades negativas. Se mantiene paralelo para que el modelo funcione, no porque los datos muestren que la edad cumple el supuesto.
+
+Para la parte predictiva, la selección se repite usando solo los datos de entrenamiento. Los términos liberados pueden ser distintos de los elegidos con la muestra completa, por lo que cada modelo se describe con su propia especificación.
+
+## Cómo se interpreta la humedad en el PPO final
+
+La humedad es la deficiencia física que recibe un coeficiente distinto por corte. Los siguientes valores proceden del PPO ajustado en las cinco bases imputadas y combinado con Rubin. La referencia es no presentar humedad.
+
+| Corte | Evento cuyos odds se comparan | Coeficiente de humedad | OR | IC del 95 % del OR |
+|:--:|:--|--:|--:|:--|
+| 1 | Superar «Totalmente insatisfecho» | -0,641 | 0,527 | [0,362; 0,766] |
+| 2 | Superar el conjunto de respuestas de insatisfacción | -0,862 | 0,422 | [0,358; 0,498] |
+| 3 | Estar satisfecho o totalmente satisfecho | -0,862 | 0,422 | [0,368; 0,485] |
+| 4 | Estar totalmente satisfecho | -0,561 | 0,570 | [0,494; 0,659] |
+
+Todos los OR de humedad son menores que 1, pero no tienen el mismo tamaño. Para el corte 3, el OR es aproximadamente 0,422: entre perfiles con iguales demás covariables, los odds de satisfacción alta son aproximadamente 57,8 % menores cuando se presenta humedad. Para el corte 4, el OR es 0,570, que corresponde aproximadamente a 43,0 % menos odds de responder «Totalmente satisfecho».
+
+La diferencia entre esos valores explica por qué un único OR no resume toda la relación. Los porcentajes anteriores describen odds; las probabilidades de satisfacción alta y sus diferencias en puntos porcentuales se presentan mediante los efectos marginales. Los coeficientes de las otras cinco deficiencias permanecen comunes a los cortes en esta especificación.
+
+El PPO completo tiene 79 parámetros frente a 52 del modelo restringido comparable. Una variable con varios niveles añade varios coeficientes al liberarse; por eso el aumento de parámetros no se cuenta únicamente por número de variables. La revisión de convergencia y probabilidades acompaña esa mayor flexibilidad.
+
+## Interpretación de los resultados del modelo
+
+Una fila de resultados reúne distintas formas de describir la misma asociación. Para leerla hay que identificar primero qué variable se compara, cuál es su referencia y a qué corte corresponde. Después se interpretan el coeficiente, su precisión y el OR. En una variable liberada, cambiar de corte significa cambiar la comparación de respuestas.
+
+La siguiente fila procede del PPO final, combinado entre las cinco imputaciones:
+
+| Variable y comparación | Corte | Coeficiente | Error estándar | OR | IC del 95 % del OR | Valor p |
+|:--|:--:|--:|--:|--:|:--|--:|
+| Humedad: Sí frente a No | 1 | −0,641 | 0,191 | 0,527 | [0,362; 0,766] | 0,000792 |
+
+La lectura se hace en este orden:
+
+1. Variable y referencia. Se compara presentar humedad con no presentarla, considerando las demás características incluidas en el PPO. La referencia es «No».
+2. Corte. El corte 1 separa «Totalmente insatisfecho» de las otras cuatro respuestas. Por eso el evento de esta fila es $Y>1$. No es todavía la comparación específica de satisfacción alta, que corresponde al corte 3.
+3. Coeficiente. El valor −0,641 está en la escala del logaritmo de los odds. Su signo negativo indica menores odds de superar el corte para el perfil con humedad. El número no es un porcentaje ni una diferencia en puntos porcentuales.
+4. Error estándar. El valor 0,191 expresa la incertidumbre de la estimación del coeficiente. Se encuentra en su misma escala y recoge la combinación del diseño y la imputación utilizada. No significa 19,1 % de error en la probabilidad.
+5. Odds ratio. Al aplicar la exponencial al coeficiente se obtiene $e^{-0,641}\approx0,527$. Los odds de superar el corte son aproximadamente 0,527 veces los del perfil comparable sin humedad, es decir, alrededor de 47,3 % menores.
+6. Intervalo del OR. El rango de 0,362 a 0,766 muestra la precisión del OR estimado. Se obtiene exponenciando los límites del intervalo del coeficiente; por eso suele ser asimétrico alrededor del OR. Como no incluye 1, el resultado distingue una asociación diferente de cero en la escala del coeficiente al nivel del 5 %.
+7. Valor p. El valor 0,000792 corresponde al contraste de que ese coeficiente sea cero, equivalente a un OR de 1. Es menor que 0,05. Informa sobre la evidencia frente a esa hipótesis; no mide el tamaño ni la importancia práctica de la asociación.
+
+Una redacción integrada sería: «En el corte que separa la insatisfacción total de las demás respuestas, presentar humedad se relaciona con menores odds de superar ese nivel, considerando las otras covariables: OR = 0,527; IC del 95 %: 0,362–0,766; p < 0,001».
+
+El valor p de esta fila no es el contraste de paralelismo. La fila pregunta si el coeficiente de humedad en el corte 1 es cero; el contraste de paralelismo pregunta si sus coeficientes son iguales entre los cuatro cortes. Son hipótesis distintas y pueden producir decisiones distintas.
+
+Para un término común a los cuatro cortes, la fila se interpreta de la misma forma, pero su OR es compartido por las cuatro comparaciones. Para un intercepto, esta lectura de «Sí frente a No» no corresponde: el intercepto sitúa el corte y no representa una diferencia entre dos categorías de un predictor.
+
+## Cruce de curvas y probabilidades válidas
+
+Sea $q_j=P(Y>j)$. Las probabilidades de categoría son:
+
+$$
+p_1=1-q_1,\quad p_2=q_1-q_2,\quad p_3=q_2-q_3,
+\quad p_4=q_3-q_4,\quad p_5=q_4.
+$$
+
+Las probabilidades acumuladas superiores están anidadas: estar por encima de 4 implica estar por encima de 3, y así sucesivamente. Por esa razón deben disminuir al aumentar el corte. Se necesita $1\geq q_1\geq q_2\geq q_3\geq q_4\geq0$. Aunque cada $q_j$ esté entre 0 y 1, las curvas de dos cortes pueden cruzarse, romper ese orden y producir probabilidades negativas en alguna categoría. Por eso se revisan la convergencia, los errores estándar, las probabilidades y que sumen uno en cada persona.
+
+Que las probabilidades sean válidas para las combinaciones que aparecen en la encuesta no asegura que lo sean para cualquier otra combinación de características. Además, la comprobación presentada usa los coeficientes combinados entre imputaciones, aplicados a cada base completada; la revisión de cada ajuste por separado se hace con otra función.
+
+## Comparación con el modelo restringido
+
+El contraste conjunto de las pendientes liberadas evalúa si se pueden volver a igualar. También se calculan la deviance y el AIC ponderados, con pesos normalizados. En el cálculo del trabajo, la deviance ponderada es $-2\ell_w$ y el AIC ponderado es $-2\ell_w+2q$, donde $q$ cuenta los parámetros. Con los mismos datos y escala de pesos, valores menores describen mejor ajuste o un mejor equilibrio entre ajuste y complejidad. Son criterios de pseudoverosimilitud de encuesta, por lo que se utilizan como referencias descriptivas. Se informan como referencia: el AIC pasa de aproximadamente 25.271,96 en el modelo restringido a 25.164,83 en el PPO, con 52 y 79 parámetros respectivamente.
+
+Estas medidas no reemplazan el contraste de diseño ni muestran que el PPO prediga mejor. Su valor depende de la escala de los pesos, y la imputación agrega otra fuente de incertidumbre. Los contrastes combinados después de imputar y seleccionar variables son aproximaciones, porque los grados de libertad de diseño no recogen toda esa incertidumbre.
+
+# Efectos marginales y lectura de los resultados
+
+Después de estimar el PPO, sus coeficientes se traducen a probabilidades para facilitar la lectura. Para cada deficiencia se compara a la misma población en dos escenarios: con esa condición y sin ella. El promedio de las diferencias expresa la relación en puntos porcentuales, junto con un intervalo que muestra su precisión.
+
+## Comparación con y sin cada deficiencia
+
+Para una deficiencia $D_k$, se calcula la probabilidad de satisfacción alta de cada persona en dos escenarios, con la deficiencia y sin ella, manteniendo sus demás características. El promedio ponderado de la diferencia es el efecto marginal promedio (AME, por su sigla en inglés):
+
+$$
+\widehat{AME}_k=
+\frac{\sum_iw_i\left[
+\widehat P(Y_i\geq4\mid D_{ik}=1,\mathbf{x}_{i,-k})-
+\widehat P(Y_i\geq4\mid D_{ik}=0,\mathbf{x}_{i,-k})\right]}
+{\sum_iw_i}.
+$$
+
+En la fórmula, $i$ identifica a cada persona y $k$ a la deficiencia. $D_{ik}=1$ representa el escenario con la deficiencia y $D_{ik}=0$ el escenario sin ella; $\mathbf{x}_{i,-k}$ reúne las otras características, que se mantienen iguales. Los pesos $w_i$, correspondientes al factor de expansión, permiten promediar las diferencias según la población representada.
+
+La operación consiste en calcular las dos probabilidades para cada persona, restar «con deficiencia menos sin deficiencia» y obtener el promedio ponderado. Se multiplica por 100 para expresarlo en puntos porcentuales (pp), que son la diferencia entre dos porcentajes. Se llama cambio discreto porque se compara «Sí» con «No», y estandarizado porque se utiliza la misma población y se conservan sus otras características. Una diferencia negativa indica menor probabilidad ajustada de satisfacción alta en el escenario con la deficiencia.
+
+Para un efecto $g(\boldsymbol\eta)$, el método delta aproxima su varianza mediante:
+
+$$
+\widehat{\operatorname{Var}}\{g(\widehat{\boldsymbol\eta})\}
+\approx \nabla g^{\top}\widehat V\nabla g.
+$$
+
+El método delta permite trasladar la incertidumbre de los coeficientes al AME. En la expresión, $g$ es el resultado calculado con esos coeficientes, $\widehat V$ es su matriz de covarianza y $\nabla g$ indica cuánto cambia ese resultado cuando los coeficientes varían ligeramente. Estos cambios se calculan numéricamente y se denominan gradientes numéricos.
+
+Se calcula el AME y su varianza en cada base imputada, y luego se combinan mediante las reglas de Rubin. Así se obtiene el error estándar (EE), que expresa la incertidumbre de la estimación, y el intervalo de confianza (IC) del 95 %. Si el intervalo de una diferencia incluye cero, no se distingue una diferencia de cero al nivel del 5 % con ese procedimiento.
+
+## Resultados de las seis deficiencias
+
+| Deficiencia | Cambio en satisfacción alta, pp | IC del 95 %, pp |
+|:--|--:|:--|
+| Humedad o goteras | −13,80 | [−16,05; −11,56] |
+| Frío | −7,55 | [−9,59; −5,50] |
+| Falta de ventilación | −7,03 | [−10,23; −3,83] |
+| Escasez de luz natural | −3,25 | [−5,75; −0,74] |
+| Ruidos molestos | −2,15 | [−3,92; −0,39] |
+| Calor | −0,91 | [−2,60; 0,78] |
+
+La humedad se relaciona con una menor satisfacción con la vivienda: la probabilidad de satisfacción alta es de aproximadamente 82,85 % en el escenario sin humedad y de 69,04 % en el escenario con humedad, una diferencia de −13,80 pp. Son probabilidades calculadas para la misma población en ambos escenarios, no los porcentajes observados en dos grupos distintos de personas.
+
+Para el calor, el intervalo incluye cero: los datos no permiten distinguir su relación promedio con la satisfacción alta de una relación nula. Esto no significa que el calor no tenga ninguna importancia; su relación puede variar entre grupos o aportar a la predicción junto con otras variables.
+
+# Comparación territorial: Maule, macrozonas y regiones
+
+La comparación territorial parte de los porcentajes observados y luego toma en cuenta que la población de cada territorio tiene características distintas. Se calculan probabilidades ajustadas para comparar territorios como si tuvieran la misma población. Así se distingue la brecha que aparece directamente en la encuesta de la que queda después del ajuste.
+
+## Brecha cruda frente a brecha ajustada
+
+Una brecha cruda compara los porcentajes observados en poblaciones con características diferentes. Una brecha ajustada compara las predicciones para una misma población:
+
+$$
+\widehat\Delta_{M}=
+\frac{\sum_iw_i\left[
+\widehat P(Y_i\geq4\mid T_i=\mathrm{Maule},\mathbf{x}_i)-
+\widehat P(Y_i\geq4\mid T_i=\mathrm{Resto},\mathbf{x}_i)\right]}
+{\sum_iw_i}.
+$$
+
+La brecha cruda estimada es 6,18 pp a favor del Maule, mientras que la ajustada con el PPO es 0,85 pp, con un IC del 95 % de −1,54 a 3,23 pp. Después del ajuste, la diferencia no se distingue de cero. La reducción coincide con que la población del Maule tiene características distintas a la del resto del país, aunque no indica cuánto aporta cada característica. Además, la brecha cruda usa casos completos y la ajustada usa datos imputados, por lo que no comparan exactamente las mismas muestras.
+
+## Macrozonas y precisión regional
+
+Las regiones se agrupan en Norte, Centro y Sur para presentar porcentajes y mapas. Comparar macrozonas puede dar más precisión que comparar regiones, pero oculta las diferencias entre regiones de una misma macrozona.
+
+Las comparaciones formales usan regresiones y contrastes que consideran el diseño. Que dos intervalos se superpongan en un gráfico no reemplaza el intervalo de su diferencia. Tampoco se elimina una región solo por tener menos entrevistas: se revisan su error estándar, el número de UPM, las categorías observadas y la calidad de la estimación.
+
+# Partición de datos y prevención de fuga de información
+
+Explicar relaciones y predecir requieren evaluaciones distintas. Para saber si un modelo anticipa bien respuestas nuevas, se reserva una parte de los datos que no se usa para entrenarlo. Hay fuga de información cuando datos de esa parte reservada se filtran, directa o indirectamente, al entrenamiento. Aquí se describe cómo se separan las personas por conglomerados y cómo se completan los datos sin usar la respuesta que después se quiere predecir.
+
+## Por qué se separan entrenamiento y prueba
+
+Con los datos de entrenamiento se estiman los parámetros, se eligen configuraciones y se definen reglas. Con los datos de prueba se mide el desempeño en personas reservadas. Si la prueba se usara una y otra vez para elegir modelos, pasaría a ser parte del entrenamiento y el desempeño se vería mejor de lo que es.
+
+Se destina aproximadamente 80 % a entrenamiento y 20 % a prueba: las tablas registran 8.972 personas y 6.061 conglomerados en entrenamiento, y 2.262 personas y 1.515 conglomerados en prueba. Las personas sin respuesta de satisfacción participan en la imputación, pero la evaluación predictiva usa solo respuestas observadas; por eso el número evaluado puede ser menor que 2.262.
+
+La partición se hace por conglomerado, para que personas de una misma UPM no queden en ambos conjuntos. Los estratos de la partición combinan el estrato de la encuesta con si la UPM tiene al menos una persona insatisfecha. Esto ayuda a repartir las categorías menos frecuentes entre ambos conjuntos, aunque no asegura proporciones idénticas en las cinco categorías.
+
+## Imputación para inferencia y para predicción
+
+En el análisis explicativo con toda la muestra, usar la respuesta para imputar los predictores puede ser apropiado, porque ayuda a conservar las relaciones de los datos observados. Al predecir, en cambio, la respuesta de una persona nueva no está disponible, por lo que no debe usarse para completar sus predictores.
+
+En la partición, el código usa `ignore = es_prueba` para que las personas de prueba no participen en la estimación de los modelos de imputación, y oculta su respuesta antes de imputar. Después recupera su respuesta observada para evaluar. Así, la prueba queda separada del entrenamiento en la imputación.
+
+Límite de la validación interna: el código imputa los datos de entrenamiento antes de dividirlos en los cinco pliegues de XGBoost (los grupos de la validación cruzada, que se explican en la sección de hiperparámetros). En una validación cruzada estricta, la imputación se haría de nuevo dentro de cada pliegue y la respuesta del pliegue de validación se ocultaría al imputar sus predictores. Con la implementación actual, la imputación usa información de personas que luego sirven para la validación interna, lo que puede hacer que la elección de hiperparámetros se vea mejor de lo que es. Esto no contamina la prueba reservada, pero limita lo que muestra la validación cruzada (CV).
+
+# XGBoost: fundamento y aplicación concreta
+
+Se agrega un segundo procedimiento para explorar si relaciones más flexibles permiten predecir mejor. XGBoost construye muchos árboles de decisión pequeños y suma sus aportes. Se entrena con los mismos predictores y se evalúa en la misma prueba que el PPO, de modo que comparten la muestra de evaluación. Las diferencias de ponderación y regla de clasificación se explican al interpretar su desempeño.
+
+## Árboles, boosting y probabilidades
+
+Un árbol separa a las personas mediante reglas sucesivas del tipo “¿tiene humedad?” y asigna una puntuación a cada grupo final, llamado hoja. El boosting agrega árboles uno tras otro, y cada nuevo árbol corrige parte de los errores de los anteriores. XGBoost combina esa estrategia con regularización, que limita la complejidad del modelo, y con métodos de cálculo eficientes (Chen y Guestrin, 2016).
+
+Para las cinco categorías de respuesta, o clases, el modelo genera puntuaciones $s_{ik}$ y las convierte en probabilidades que suman uno con la función softmax:
+
+$$
+p_{ik}=\frac{\exp(s_{ik})}{\sum_{h=1}^{5}\exp(s_{ih})}.
+$$
+
+$s_{ik}$ es la puntuación de la persona $i$ para la categoría $k$. Softmax compara esa puntuación con las de las otras cuatro categorías y produce cinco probabilidades que suman uno. No se elige todavía una categoría: esa elección se realiza después mediante una regla de clasificación.
+
+El objetivo conceptual suma pérdida y penalización:
+
+$$
+\mathcal L=
+\sum_i\omega_i\,[-\log p_{i,Y_i}]+\sum_t\Omega(f_t),
+\qquad
+\Omega(f_t)=\gamma T_t+\frac{\lambda}{2}\sum_{u=1}^{T_t}a_{tu}^2.
+$$
+
+La pérdida mide cuánto se equivocan las probabilidades predichas respecto de las respuestas reales. $\omega_i$ es el peso de cada persona, $T_t$ es la cantidad de hojas del árbol $t$ y $a_{tu}$ la puntuación de cada hoja. El algoritmo aproxima cómo cambia la pérdida usando gradientes y segundas derivadas; para una hoja, la puntuación óptima es proporcional a $-G/(H+\lambda)$, donde $G$ y $H$ son sumas de gradientes y curvaturas. La versión para varias clases aplica este principio a cada una de sus puntuaciones.
+
+Se usa el objetivo `multi:softprob`. Esta pérdida trata las cinco clases como distintas, sin considerar que equivocarse de 1 a 5 sea más grave que de 1 a 2. El orden de las respuestas se considera en la evaluación, mediante el QWK, y en la definición de los eventos, no en la pérdida de XGBoost.
+
+## Cómo aprende el conjunto de árboles
+
+Cada árbol aplica una secuencia de divisiones de los predictores y termina en hojas. Una hoja entrega una puntuación, no un coeficiente comparable a un OR. El conjunto suma los aportes de los árboles para formar la puntuación de cada categoría. Los árboles siguientes se incorporan para reducir la pérdida que permanece después de los anteriores.
+
+La pérdida multiclase usada en el trabajo es la entropía cruzada: para cada persona se toma $-\log p_{i,Y_i}$, donde $p_{i,Y_i}$ es la probabilidad asignada a su respuesta observada. Asignar probabilidad pequeña a la respuesta real genera una pérdida alta. Los pesos de expansión y de balance hacen que las personas y las categorías no contribuyan todas con el mismo peso al objetivo.
+
+La regularización añade un costo por complejidad. En la fórmula anterior, $\gamma$ penaliza agregar hojas y $\lambda$ penaliza puntuaciones grandes en las hojas. La tasa de aprendizaje reduce el aporte de cada actualización. Así se busca que el conjunto aprenda relaciones que se sostengan fuera de las observaciones usadas para ajustarlo.
+
+El trabajo expresa la mejora de una división con:
+
+$$
+\operatorname{Ganancia}=\frac12\left[
+\frac{G_L^2}{H_L+\lambda}+
+\frac{G_R^2}{H_R+\lambda}-
+\frac{(G_L+G_R)^2}{H_L+H_R+\lambda}
+\right]-\gamma.
+$$
+
+$L$ y $R$ identifican los grupos izquierdo y derecho de la división. $G$ suma las primeras derivadas de la pérdida, que orientan la corrección, y $H$ las segundas derivadas, que indican su curvatura. Los dos primeros términos valoran los grupos separados; el tercero valora mantenerlos unidos; $\gamma$ descuenta el costo de dividir. Esta expresión explica el criterio de ganancia utilizado en los árboles y la importancia por Gain. No mide directamente un aumento de AUC o QWK en la prueba.
+
+La formulación escalar de ganancia explica el principio del algoritmo; en clasificación multiclase ese principio se aplica a las puntuaciones de las categorías. La función `multi:softprob` trata las clases como distintas: la penalización específica por distancia ordinal aparece en la evaluación mediante QWK, no en la entropía cruzada.
+
+## Codificación y supuestos prácticos
+
+Los 24 predictores son los mismos del PPO. Cada variable categórica se convierte en indicadores one-hot (una columna de 0 y 1 por categoría) y luego las importancias se suman por variable original. Los árboles no necesitan una categoría de referencia, porque no estiman pendientes como una regresión.
+
+XGBoost no exige odds proporcionales ni normalidad, pero sí necesita datos representativos de la población donde se aplicará, ausencia de fuga de información, control del sobreajuste (que el modelo aprenda detalles propios de la muestra que no se repiten en datos nuevos) y una evaluación acorde con la decisión. Puede captar interacciones y relaciones complejas, pero esa flexibilidad no asegura un mejor desempeño con una muestra y unos datos determinados.
+
+## Hiperparámetros y búsqueda utilizada
+
+Los hiperparámetros son valores que se fijan antes de entrenar para controlar cómo aprende el algoritmo. Se comparan con validación cruzada: el entrenamiento se divide en cinco grupos o pliegues; el modelo se ajusta con cuatro y se evalúa con el restante, y esto se repite hasta que cada grupo haya servido para validar. Con el promedio se elige una configuración antes de usar la prueba reservada.
+
+| Parámetro | Función | Configuración explorada en el código |
+|:--|:--|:--|
+| `max_depth` | Profundidad máxima de árboles | Valores entre 2 y 9 |
+| `learning_rate` | Tamaño del aporte de cada actualización | Muestreo entre 0,01 y 0,25 |
+| `subsample` | Fracción de observaciones para construir árboles | Muestreo entre 0,60 y 1 |
+| `min_child_weight` | Mínima suma de curvaturas/peso para una hoja | Muestreo entre 1 y 30 |
+| Número de rondas | Cantidad de actualizaciones de boosting | 25 a 400, en pasos de 25 |
+
+Se generan 24 configuraciones al azar y cada una se evalúa en cinco pliegues formados por conglomerados completos. Se elige la de mayor QWK promedio. Los rangos describen el espacio explorado; no se evaluaron todas las combinaciones posibles. La validación cruzada (CV, por su nombre en inglés) se hace una sola vez.
+
+## Configuración seleccionada y significado de sus valores
+
+La tabla de validación cruzada selecciona la configuración C20 con los siguientes valores:
+
+| Elemento | Valor seleccionado | Lectura dentro del ajuste |
+|:--|--:|:--|
+| Rondas de boosting | 100 | Se incorporan 100 rondas de actualización |
+| Profundidad máxima | 4 | Limita la cantidad de divisiones sucesivas por camino |
+| Tasa de aprendizaje | 0,0659 | Modera el aporte de las actualizaciones |
+| Submuestreo | 0,61 | Se utiliza una fracción de las filas en cada construcción de árboles |
+| Peso mínimo por hoja | 17,8 | Restringe la suma mínima de segundas derivadas ponderadas |
+| QWK promedio de validación | 0,3141 | Criterio con el que se ordenan las configuraciones |
+| Desviación del QWK entre pliegues | 0,0270 | Describe su variación entre los cinco pliegues |
+
+El mínimo por hoja no significa exactamente 17,8 personas. Se refiere a la cantidad interna del algoritmo indicada en la tabla. La desviación entre pliegues tampoco es, por sí sola, un intervalo de confianza de encuesta.
+
+Con cinco categorías, la configuración utilizada genera un árbol por categoría en cada ronda: 100 rondas corresponden a 500 árboles en total. Por ello no se debe confundir número de rondas con número total de árboles. La combinación es el modelo predictivo; un árbol aislado no representa por sí solo sus decisiones finales.
+
+La configuración se elige dentro de entrenamiento. Después se entrena con todo ese conjunto y se evalúa en la prueba reservada. El reajuste posterior con toda la base se utiliza para describir importancia, y no recibe una nueva evaluación independiente con esos mismos datos.
+
+## Imputaciones apiladas y balance de clases
+
+Para XGBoost se apilan las cinco bases completadas. Cada persona aparece cinco veces con peso inicial $w_i/5$, y para evaluar se promedian sus cinco probabilidades. Las cinco copias de una persona quedan siempre en el mismo conjunto y pliegue.
+
+Apilar permite entrenar con varias versiones plausibles de los datos, pero no multiplica por cinco el número de personas independientes ni entrega errores estándar de Rubin para el algoritmo. Después los pesos se normalizan, lo que cambia su escala total; como el efecto de la regularización depende de esa escala, el ajuste puede cambiar aunque los pesos relativos entre personas se mantengan.
+
+El balance de clases multiplica los pesos por un factor proporcional al inverso de la prevalencia de cada clase en entrenamiento, de modo que las categorías menos frecuentes reciben más peso:
+
+$$
+\omega_i\propto\frac{w_i}{\widehat\pi_{Y_i}}.
+$$
+
+Así, equivocarse en una categoría poco frecuente pesa más. Esto cambia lo que el modelo aprende: puede bajar la exactitud total a cambio de reconocer mejor las categorías minoritarias. Las probabilidades obtenidas con balance no tienen por qué estar calibradas, es decir, no tienen por qué coincidir con las frecuencias reales de la población.
+
+# Reglas de clasificación y métricas
+
+Cada modelo entrega cinco probabilidades por persona. Para asignar una categoría predicha hace falta una regla de decisión, y para evaluar esa decisión hacen falta métricas. Esta etapa separa ambas cosas y explica por qué un modelo puede acertar muchas veces en la categoría más frecuente y, aun así, reconocer mal las demás.
+
+## Dos reglas para el PPO
+
+La clase más probable se elige mediante $\widehat Y_i=\arg\max_k\widehat p_{ik}$. La regla balanceada utiliza:
+
+$$
+\widehat Y_i^{bal}=\arg\max_k\frac{\widehat p_{ik}}{\widehat\pi_k},
+$$
+
+donde $\widehat\pi_k$ es la prevalencia de cada clase estimada en entrenamiento. Esta segunda regla favorece la detección de clases poco frecuentes. Se basa en una idea parecida a dar más peso a las clases escasas, pero no equivale exactamente a entrenar XGBoost con pesos balanceados, porque son modelos y ajustes distintos. Tampoco cambia las probabilidades del PPO: solo cambia la categoría que se asigna.
+
+## Matriz de confusión ponderada
+
+$$
+O_{ab}=\sum_{i\in prueba}w_i\,
+\mathbb{1}(Y_i=a,\widehat Y_i=b).
+$$
+
+La matriz de confusión cruza la categoría real con la predicha: las filas son las clases reales y las columnas las predichas. Al expresar cada fila en porcentaje se ve qué parte de cada clase real se identifica correctamente. Los pesos hacen que el desempeño se refiera a la población representada por el conjunto de prueba.
+
+## Exactitud, sensibilidad y exactitud balanceada
+
+$$
+\operatorname{Exactitud}=\frac{\sum_kO_{kk}}{\sum_{a,b}O_{ab}},
+\qquad
+\operatorname{Sensibilidad}_k=\frac{O_{kk}}{\sum_bO_{kb}},
+$$
+
+$$
+\operatorname{Exactitud\ balanceada}=
+\frac15\sum_{k=1}^{5}\operatorname{Sensibilidad}_k.
+$$
+
+La exactitud es el porcentaje total de aciertos; la sensibilidad de una clase es el porcentaje de personas de esa clase que el modelo identifica correctamente; la exactitud balanceada es el promedio simple de las cinco sensibilidades. Cuando una clase es mucho más frecuente que las demás, puede dominar la exactitud. Para calcular las cinco sensibilidades, cada clase debe tener personas en el conjunto de prueba.
+
+## QWK: acuerdo con penalización ordinal
+
+El kappa con ponderación cuadrática utiliza:
+
+$$
+d_{ab}=\frac{(a-b)^2}{(5-1)^2},
+\qquad
+E_{ab}=\frac{O_{a+}O_{+b}}{N_w},
+$$
+
+$$
+\operatorname{QWK}=1-
+\frac{\sum_{a,b}d_{ab}O_{ab}}
+{\sum_{a,b}d_{ab}E_{ab}},
+\qquad N_w=\sum_{a,b}O_{ab}.
+$$
+
+El QWK mide el acuerdo entre la categoría real y la predicha, y castiga más los errores grandes: confundir 1 con 5 pesa más que confundir 1 con 2. $E$ es el acuerdo que se esperaría por simple azar, dadas las frecuencias de cada clase. El QWK vale 1 con acuerdo perfecto y puede ser cero o negativo. No es un porcentaje de aciertos y también depende de cómo se reparten las clases reales y predichas. Requiere que el denominador no sea cero (Cohen, 1968).
+
+## ROC y AUC de insatisfacción
+
+La puntuación de riesgo es $s_i=P(Y_i\leq2)=p_{i1}+p_{i2}$, la probabilidad de estar insatisfecho o totalmente insatisfecho. Para cada valor de corte $c$ se marca como “en riesgo” a quienes lo superan y se calculan, con pesos, la sensibilidad y la tasa de falsos positivos (el porcentaje de personas no insatisfechas marcadas como en riesgo). La curva ROC muestra cómo cambian ambas al mover el corte, y el AUC (el área bajo esa curva) mide qué tan bien se distingue a las personas insatisfechas del resto.
+
+Un AUC de 0,75 indica aproximadamente que una persona insatisfecha recibe mayor puntuación que una no insatisfecha en el 75 % de las comparaciones ponderadas, considerando los empates. No significa 75 % de clasificaciones correctas ni que las probabilidades estén bien calibradas.
+
+Para elegir un umbral de alerta hacen falta los costos de los falsos positivos y negativos, la capacidad de intervención y una validación. El AUC resume qué tan bien se ordena el riesgo, sin fijar ese umbral.
+
+## Precisión y F1: complemento conceptual
+
+La precisión por clase es $P_k=O_{kk}/O_{+k}$, el porcentaje de aciertos entre quienes el modelo asigna a esa clase, y el F1 es $2P_kR_k/(P_k+R_k)$, con $R_k$ como sensibilidad. Sirven para estudiar las falsas alarmas y la recuperación de cada clase. La evaluación presentada usa exactitud, exactitud balanceada, sensibilidades, QWK y AUC. Precisión y F1 se explican como métricas complementarias, pero no se presentan resultados para ellas. Lo mismo ocurre con la calibración, que no se puede dar por comprobada a partir del AUC.
+
+# Cómo comparar PPO y XGBoost
+
+La comparación reúne las métricas anteriores y las relaciona con el propósito del estudio. Se revisa qué modelo ordena mejor el riesgo, cuál reconoce mejor las categorías minoritarias y con qué precisión se estima la diferencia entre ambos. La elección también depende de si se necesita explicar relaciones o clasificar personas.
+
+## Resultados en el conjunto de prueba
+
+| Procedimiento | Exactitud, % | Exactitud balanceada, % | QWK | AUC de insatisfacción |
+|:--|--:|--:|--:|--:|
+| PPO con regla balanceada | 30,57 | 31,33 | 0,350 | 0,751 |
+| XGBoost con pesos balanceados | 32,10 | 30,57 | 0,333 | 0,743 |
+| Siempre predecir “Satisfecho” | 54,60 | 20,00 | 0,000 | 0,500 |
+
+Las métricas se calculan sobre el mismo conjunto de prueba y usan los factores de expansión. Predecir siempre la categoría más frecuente da más exactitud porque esa categoría domina, pero no distingue el riesgo ni reconoce las demás categorías. Por eso la exactitud, por sí sola, no basta para juzgar la utilidad de un modelo.
+
+El PPO tiene mayor QWK, exactitud balanceada y AUC en estos valores. XGBoost tiene mayor exactitud. Cuál conviene depende del objetivo: explicar, clasificar en la escala ordenada, reconocer categorías poco frecuentes o alertar sobre insatisfacción. Estas diferencias son valores puntuales y no necesariamente estadísticamente significativas.
+
+## Incertidumbre de la comparación y elección final
+
+Para obtener un intervalo de la diferencia de AUC se usan 500 réplicas bootstrap: se sortean con reemplazo conglomerados del conjunto de prueba y se recalcula la diferencia en cada sorteo. Se sortean UPM completas para conservar el parecido entre personas de una misma UPM. En esta implementación, el sorteo no se hace por estrato y los modelos entrenados se mantienen fijos, por lo que el intervalo no recoge toda la incertidumbre del diseño, la imputación y la selección.
+
+Si el intervalo de la diferencia incluye cero, los datos no permiten distinguir las AUC de ambos modelos con ese procedimiento, aunque eso no demuestra que sean iguales. Para afirmar que un modelo supera al otro en QWK o en exactitud balanceada harían falta análisis de incertidumbre para esas métricas.
+
+Para el objetivo explicativo del trabajo, el PPO ofrece una fórmula interpretable, errores estándar que consideran el diseño y relaciones distintas por corte cuando corresponde. XGBoost ofrece una comparación flexible y otra medida de importancia. Por eso el PPO es la herramienta explicativa principal, sin que eso lo haga superior en toda decisión predictiva.
+
+# Importancia relativa: Shapley, Gain y triangulación
+
+Para pasar de relaciones individuales a prioridades hay que definir qué significa que una deficiencia sea importante. Se usan dos criterios: cuánto mejora el ajuste del modelo ordinal y cuánto aporta a las divisiones de los árboles de XGBoost. Se explican por separado porque sus porcentajes se calculan de forma distinta, aunque después se comparan para ver en qué coinciden.
+
+## Tres conceptos diferentes
+
+El coeficiente mide la relación en la escala del modelo (el logaritmo de los odds). El AME mide un cambio promedio de probabilidad. La importancia relativa reparte entre las variables la mejora en el ajuste. Una variable puede tener un AME promedio pequeño y aun así aportar a la predicción mediante interacciones.
+
+## Dominancia general o Shapley sobre el PPO
+
+Se ajustan los $2^6=64$ modelos posibles con distintas combinaciones de las seis deficiencias, manteniendo siempre los 18 controles. Esto se repite en las cinco imputaciones: 320 ajustes. La medida de ajuste es un pseudo-$R^2$ ponderado de McFadden, que compara qué tan bien predice el modelo frente a uno sin predictores:
+
+$$
+R^2_{McF}=1-\frac{\ell_w(\text{modelo})}{\ell_w(\text{nulo})}.
+$$
+
+No es la proporción de varianza explicada, como el $R^2$ de una regresión lineal. Sea $D$ el conjunto de las seis deficiencias y $v(S)$ el ajuste del modelo con los controles más un grupo $S$ de deficiencias:
+
+$$
+\phi_k=\sum_{S\subseteq D\setminus\{k\}}
+\frac{|S|!\,(6-|S|-1)!}{6!}
+\left[v(S\cup\{k\})-v(S)\right].
+$$
+
+Es decir, se promedia cuánto mejora el ajuste al agregar la deficiencia $k$, considerando todas las combinaciones posibles de las demás. La suma de estas contribuciones es la mejora total que aportan las seis deficiencias sobre el modelo que ya tiene los controles. Al dividir por esa suma, $W_k=\phi_k/\sum_h\phi_h$, se obtienen pesos que suman uno (Luchman, 2014).
+
+Como los controles están siempre presentes, un peso de 40 % significa 40 % de la importancia atribuida al conjunto de las seis deficiencias, no 40 % de toda la satisfacción. Estos valores de Shapley sobre el ajuste tampoco son las explicaciones SHAP individuales que se usan con XGBoost. Antes de interpretarlos, hay que comprobar que los ajustes sean válidos y que los pesos sean estables.
+
+## Cómo se obtiene el aporte de Shapley paso a paso
+
+El punto de partida es el modelo que ya contiene los 18 controles. Las seis deficiencias forman el bloque cuya contribución adicional se quiere repartir. Por ello, todos los modelos comparados mantienen los controles y solo cambian las deficiencias incluidas.
+
+Para estudiar humedad se compara cada modelo que no la contiene con el mismo modelo después de agregarla. Se calcula cuánto aumenta el pseudo-$R^2$ en cada comparación. La operación se repite cuando humedad entra sola, cuando entra junto con otra deficiencia y cuando entra después de grupos de dos, tres, cuatro o cinco deficiencias. Finalmente se promedian esos aumentos con los pesos de Shapley. Se hace lo mismo para las otras cinco condiciones.
+
+En la fórmula anterior, $S$ es un grupo de deficiencias que todavía no incluye a la que se estudia; $|S|$ cuenta cuántas hay en ese grupo; y $v(S\cup\{k\})-v(S)$ es la mejora al agregar la deficiencia $k$. El factor con factoriales pondera las combinaciones para considerar los distintos órdenes posibles de incorporación. La importancia no queda determinada por haber ingresado una variable primero o al final de una sola secuencia.
+
+El cálculo se repite en las cinco bases imputadas. En el código, se promedian los aportes de cada deficiencia entre imputaciones y después se dividen por la suma de esos aportes para obtener los porcentajes finales. Si $\overline\phi_k$ es ese aporte promedio:
+
+$$
+\mathrm{Peso}_{k,\mathrm{PPO}}(\%)=
+100\frac{\overline\phi_k}{\sum_{h=1}^{6}\overline\phi_h}.
+$$
+
+El aporte está en la escala del pseudo-$R^2$ elegido. El peso está en una escala relativa de 0 a 100 % dentro del bloque. Son cantidades distintas: el peso indica cómo se reparte la mejora atribuida a las seis deficiencias, no qué porcentaje de la satisfacción explica cada una.
+
+## Gain de XGBoost
+
+El Gain resume la reducción del objetivo de entrenamiento atribuida a las divisiones de los árboles que usan una variable. No es una mejora directa de exactitud, QWK o AUC en la prueba. El trabajo suma el Gain de los indicadores de cada predictor y lo normaliza dentro de las seis deficiencias para construir otro conjunto de pesos.
+
+El Gain depende de la configuración, de las correlaciones entre variables, de las oportunidades de división y del peso dado a cada clase. Si dos variables comparten información, pueden repartirse la importancia de forma inestable. No indica si la relación es positiva o negativa, ni si es estadísticamente significativa, ni su retorno económico.
+
+Para describir la importancia se usa el modelo XGBoost ajustado con toda la muestra. Su desempeño predictivo, en cambio, proviene del modelo entrenado solo con el conjunto de entrenamiento, porque el modelo ajustado con toda la muestra ya no tiene datos de prueba independientes.
+
+## Cómo se transforma Gain en pesos de las deficiencias
+
+XGBoost trabaja con columnas indicadoras de las categorías. Primero se suma el Gain de las columnas pertenecientes a una misma variable original. Después se seleccionan las seis deficiencias y se divide la ganancia de cada una por la suma de ganancias de ese bloque:
+
+$$
+\mathrm{Peso}_{k,\mathrm{XGB}}(\%)=
+100\frac{G_k}{\sum_{h=1}^{6}G_h},
+$$
+
+donde $G_k$ es la ganancia agregada de la deficiencia $k$. Los 18 controles participaron en el entrenamiento; normalizar entre las seis deficiencias no significa que se hayan excluido del modelo. Significa que el porcentaje responde una pregunta concreta: cómo se distribuye la ganancia dentro de ese bloque.
+
+Un porcentaje sobre las seis deficiencias no equivale al porcentaje sobre todos los predictores. El denominador debe mantenerse explícito para no atribuir a una variable una participación en el modelo completo que la tabla no está mostrando.
+
+## Pesos obtenidos y lectura de las diferencias
+
+Los siguientes valores corresponden a las salidas de «Modelo Completo»:
+
+| Deficiencia | Aporte promedio al pseudo-$R^2$ | Peso PPO–Shapley, % | Peso XGBoost–Gain, % |
+|:--|--:|--:|--:|
+| Humedad o goteras | 0,015344 | 53,76 | 47,08 |
+| Frío en la vivienda | 0,006904 | 24,19 | 19,46 |
+| Falta de ventilación | 0,003154 | 11,05 | 8,02 |
+| Escasez de luz natural | 0,001738 | 6,09 | 6,06 |
+| Ruidos molestos | 0,000782 | 2,74 | 10,00 |
+| Calor en la vivienda | 0,000622 | 2,18 | 9,39 |
+
+La suma de aportes PPO es aproximadamente 0,028544. Para humedad, el peso se obtiene como $100\times 0,015344/0,028544\approx53{,}76\%$, usando valores redondeados solo para mostrar la operación. El cálculo original utiliza toda la precisión de las estimaciones.
+
+El 53,76 % significa que humedad concentra esa proporción de la mejora repartida entre las seis deficiencias mediante Shapley, una vez mantenidos los controles. No significa que el 53,76 % de las personas tenga humedad ni que su probabilidad de satisfacción sea 53,76 puntos menor. La prevalencia, el AME y el peso responden preguntas diferentes.
+
+En Gain, humedad recibe 47,08 % y frío 19,46 %. Ambos son los dos primeros atributos también con Shapley, pero los demás puestos cambian: la ventilación queda tercera con Shapley y los ruidos terceros con Gain. La comparación debe mirar tanto las coincidencias como esas diferencias.
+
+Shapley evalúa cuánto aporta cada deficiencia al ajuste del PPO en distintas combinaciones con las restantes. Gain registra cuánto ayudan las divisiones a reducir el objetivo de XGBoost, un modelo que admite interacciones y usa ponderación de clases. Además, las variables relacionadas comparten información. Estas diferencias de cálculo explican por qué dos porcentajes no tienen que coincidir ni uno corrige automáticamente al otro.
+
+Los pesos tienen una aplicación posterior: se multiplican por las prevalencias regionales de cada deficiencia para construir los índices. Los pesos son comunes a las regiones; lo que cambia entre regiones es la frecuencia de cada condición. Así se distingue la importancia de una deficiencia de cuánto se presenta en cada territorio.
+
+## Qué aporta que ambos métodos coincidan
+
+Si la humedad y el frío ocupan posiciones destacadas tanto por Shapley como por Gain, esa prioridad se sostiene con dos procedimientos distintos. Ambos usan la misma encuesta y las mismas decisiones de preparación, por lo que su coincidencia no equivale a repetir el análisis con datos nuevos. Si los métodos no coinciden, la diferencia puede deberse a relaciones no lineales, interacciones, correlaciones o a que cada método optimiza algo distinto.
+
+# Índice de déficit y ranking regional
+
+La última etapa combina dos piezas ya calculadas: la importancia relativa de cada deficiencia y la frecuencia con que se reporta en cada región. Una región obtiene un índice mayor cuando las deficiencias con más peso son más frecuentes en ella. Después se ordenan los índices, se evalúa la incertidumbre de las posiciones y se muestran en mapas.
+
+## Construcción del indicador
+
+Sea $D_{ik}$ el indicador de que la persona $i$ reporta la deficiencia $k$, y $W_k$ su peso de importancia, normalizado para que los seis pesos sumen uno. $S_i$ representa el puntaje de la persona e $I_r$ el índice de la región $r$:
+
+$$
+S_i=100\sum_{k=1}^{6}W_kD_{ik},
+\qquad
+I_r=\frac{\sum_{i\in r}w_iS_i}{\sum_{i\in r}w_i}
+=100\sum_{k=1}^{6}W_k\widehat\pi_{rk}.
+$$
+
+$\widehat\pi_{rk}$ es la prevalencia ponderada de la deficiencia en la región. Si los pesos no son negativos y suman uno, el índice va de 0 a 100. Un valor mayor indica que las seis deficiencias, según su peso, son más frecuentes en la región.
+
+Ejemplo hipotético con dos deficiencias: pesos 0,60 y 0,40 y prevalencias regionales 0,30 y 0,20 producen $I_r=100(0,60\cdot0,30+0,40\cdot0,20)=26$. No significa 26 % de personas insatisfechas.
+
+Se construye un índice con los pesos del PPO y otro con los de Gain. Son índices de análisis de las seis deficiencias reportadas, no una estimación oficial del déficit habitacional cuantitativo ni un conteo de viviendas que deben construirse. Cada observación es una persona adulta encuestada; para pasar de sus prevalencias a cantidades de viviendas habría que revisar la unidad de análisis y usar factores de expansión adecuados.
+
+## Incertidumbre del índice y del puesto
+
+El índice y la posición de cada región son estimaciones: con otra muestra de la misma encuesta podrían cambiar. Un intervalo de confianza del 95 % es un rango calculado con un procedimiento que, si se repitiera muchas veces, contendría el valor real de la población en aproximadamente el 95 % de los casos. Para la posición, un intervalo amplio indica que la región podría ocupar varios puestos.
+
+Cada índice regional se estima considerando el diseño y se combina entre imputaciones. Al calcular los intervalos, los pesos $W_k$ se tratan como fijos: los intervalos incluyen la incertidumbre de las prevalencias y de la imputación, pero no la de estimar los pesos de Shapley o Gain. Por eso pueden ser más estrechos de lo que serían si se incluyera también esa fuente; no se sabe cuánto sin calcularlo.
+
+Para las posiciones se simulan 5.000 rankings a partir de distribuciones normales aproximadas de los índices regionales. Se supone que los índices de distintas regiones son independientes, porque los estratos de la encuesta están dentro de cada región. Es una aproximación que depende de los pesos fijos y de la normalidad; si las regiones comparten ajustes de calibración, si los pesos estimados son comunes a todas o si un índice está cerca de 0 o de 100, podría requerirse otra evaluación.
+
+Un intervalo amplio de posición indica que el puesto exacto es incierto. Por eso conviene comparar valores e intervalos y hablar de grupos de regiones. La correlación de Spearman entre ambos rankings mide cuánto coinciden en el orden de las regiones, pero no indica que alguno de ellos sea la clasificación verdadera.
+
+## Mapas y escala común
+
+Los mapas muestran cómo se distribuyen los índices en el territorio. Los mapas por macrozona usan la misma escala de color para que un tono represente el mismo valor en todos ellos. El tamaño de una región en el mapa no refleja su población ni su incertidumbre. Que los valores cambien de forma gradual en el mapa no prueba una relación espacial estadística: el trabajo no estima un modelo espacial de satisfacción ni usa kriging (un método de interpolación espacial).
+
+# Referencias bibliográficas
+
+Los fundamentos del análisis se apoyan en las siguientes referencias. Junto a cada una se indica su relación con el procedimiento desarrollado.
+
+Agresti, A. (2013). *Categorical data analysis* (3.ª ed.). Wiley. Fundamenta la respuesta categórica, logits acumulados e interpretación de probabilidades.
+
+Chen, T., & Guestrin, C. (2016). XGBoost: A scalable tree boosting system. En *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining* (pp. 785–794). ACM. Fundamenta boosting, regularización y optimización del algoritmo.
+
+Cochran, W. G. (1977). *Sampling techniques* (3.ª ed.). Wiley. Fundamenta ponderación y precisión bajo muestreo.
+
+Cohen, J. (1968). Weighted kappa: Nominal scale agreement with provision for scaled disagreement or partial credit. *Psychological Bulletin, 70*(4), 213–220. Referencia de kappa ponderado incluida en la bibliografía del proyecto.
+
+Díaz-Serrano, L. (2009). Disentangling the housing satisfaction puzzle: Does homeownership really matter? *Journal of Economic Psychology, 30*(5), 745–755. Aporta contexto de satisfacción residencial y tenencia.
+
+Enders, C. K. (2010). *Applied missing data analysis*. Guilford Press. Fundamenta mecanismos de ausencia, imputación múltiple y combinación de incertidumbre.
+
+Fox, J., & Monette, G. (1992). Generalized collinearity diagnostics. *Journal of the American Statistical Association, 87*(417), 178–183. Fundamenta GVIF para términos con varias dimensiones.
+
+Gutiérrez, H. A. (2016). *Estrategias de muestreo: Diseño de encuestas y estimación de parámetros*. Ediciones de la U. Fundamenta estimadores y diseño de encuesta.
+
+Instituto Nacional de Estadísticas. (2020). *Fundamentos del estándar para la evaluación de la calidad de las estimaciones en encuestas de hogares*. Fundamenta la revisión de calidad y precisión de estimaciones de encuesta; los umbrales específicos deben consultarse en el documento.
+
+Luchman, J. N. (2014). Relative importance analysis with multi-category dependent variables: An extension and review of best practices. *Organizational Research Methods, 17*(4), 452–471. Fundamenta la descomposición de importancia con respuestas multicategóricas.
+
+Martínez Ibarra, E., Maycotte Pansza, E., & Sánchez Flores, E. (2017). Los determinantes de la satisfacción residencial en México. *Revista INVI, 32*(89), 41–64. Aporta antecedentes sobre vivienda, entorno y satisfacción.
+
+McCullagh, P. (1980). Regression models for ordinal data. *Journal of the Royal Statistical Society: Series B (Methodological), 42*(2), 109–142. Fundamenta modelos de regresión para categorías ordenadas.
+
+O'Brien, R. M. (2007). A caution regarding rules of thumb for variance inflation factors. *Quality & Quantity, 41*, 673–690. Sustenta la cautela con umbrales automáticos de colinealidad.
+
+Williams, R. (2006). Generalized ordered logit/partial proportional odds models for ordinal dependent variables. *The Stata Journal, 6*(1), 58–82. Fundamenta la flexibilización parcial del paralelismo.
+
+Williams, R. (2016). Understanding and interpreting generalized ordered logit models. *The Journal of Mathematical Sociology, 40*(1), 7–20. Profundiza interpretación de logits generalizados y probabilidades.
+
+Los datos analizados corresponden a la EBS 2023. Las cifras provienen de las salidas del análisis: modelos ordinales, imputación múltiple, evaluación predictiva y estimaciones territoriales. Se presentan tal como fueron estimadas; este documento las ordena y explica, sin volver a ajustar los modelos.
